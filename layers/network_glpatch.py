@@ -29,19 +29,25 @@ class InterPatchGating(nn.Module):
 
 class GLPatchNetwork(nn.Module):
     """
-    GLPatch v3 dual-stream network.
+    GLPatch v4 dual-stream network.
     
-    v3 changes vs v2:
-    1. REMOVED multiscale conv — inter-patch gating alone drives our wins.
-       Fewer params, less overfitting, cleaner architecture.
-    2. MOVED gating AFTER pointwise conv — gates on richer, already-aggregated
-       features rather than raw depthwise output. Less disruptive to the
-       feature space that pointwise conv expects.
-    3. KEPT learnable residual scaling (res_alpha=0.1) around gating.
+    Key insight from v2 vs v3: gating BEFORE pointwise conv helped ETTh2
+    long horizons; gating AFTER pointwise conv helped ETTm1 and Exchange.
+    The optimal position is dataset-dependent.
+    
+    v4 solution: dual gating at BOTH positions, each with its own learnable
+    alpha. The model discovers which position matters per dataset.
+    
+    v4 changes vs v3:
+    1. DUAL GATING — gate_pre (before pointwise) + gate_post (after pointwise)
+    2. INDEPENDENT alphas — alpha_pre and alpha_post, both init 0.1
+    3. Minimal param increase — two small MLPs (patch_num → patch_num/4 → patch_num)
+       plus two scalars. Still very close to xPatch in size.
     
     Architecture (seasonality stream):
-        Patching → Embedding → Depthwise+Residual → Pointwise →
-        [Inter-patch Gating with learnable residual] → Flatten Head
+        Patching → Embedding → Depthwise+Residual →
+        [Pre-gating with alpha_pre] → Pointwise →
+        [Post-gating with alpha_post] → Flatten Head
     """
     def __init__(self, seq_len, pred_len, patch_len, stride, padding_patch):
         super(GLPatchNetwork, self).__init__()
@@ -77,17 +83,20 @@ class GLPatchNetwork(nn.Module):
         # Residual Stream (from xPatch)
         self.fc2 = nn.Linear(self.dim, patch_len)
 
+        # [GLCN] Pre-pointwise gating — gates on per-patch features
+        # Helps ETTh2 long horizons (v2 evidence)
+        self.gate_pre = InterPatchGating(self.patch_num, reduction=4)
+        self.alpha_pre = nn.Parameter(torch.tensor(0.1))
+
         # CNN Pointwise (from xPatch)
         self.conv2 = nn.Conv1d(self.patch_num, self.patch_num, 1, 1)
         self.gelu3 = nn.GELU()
         self.bn3 = nn.BatchNorm1d(self.patch_num)
 
-        # [GLCN] Inter-patch Gating — now AFTER pointwise conv
-        # Gates on richer, already-aggregated inter-patch features
-        self.inter_patch_gate = InterPatchGating(self.patch_num, reduction=4)
-
-        # [v2+] Learnable residual scaling
-        self.res_alpha = nn.Parameter(torch.tensor(0.1))
+        # [GLCN] Post-pointwise gating — gates on aggregated features
+        # Helps ETTm1, Exchange (v3 evidence)
+        self.gate_post = InterPatchGating(self.patch_num, reduction=4)
+        self.alpha_post = nn.Parameter(torch.tensor(0.1))
 
         # Flatten Head (from xPatch)
         self.flatten1 = nn.Flatten(start_dim=-2)
@@ -150,19 +159,23 @@ class GLPatchNetwork(nn.Module):
         # Residual Stream
         res = self.fc2(res)
         s = s + res
+        # s: [B*C, patch_num, patch_len]
+
+        # [GLCN] Pre-pointwise gating with learnable blend
+        s_pre = s
+        s_gated_pre = self.gate_pre(s)
+        s = s_pre + self.alpha_pre * (s_gated_pre - s_pre)
 
         # CNN Pointwise
         s = self.conv2(s)
         s = self.gelu3(s)
         s = self.bn3(s)
-        # s: [B*C, patch_num, patch_len] — rich, aggregated features
+        # s: [B*C, patch_num, patch_len]
 
-        # [GLCN] Inter-patch Gating with learnable residual
-        s_base = s
-        s_gated = self.inter_patch_gate(s)
-        s = s_base + self.res_alpha * (s_gated - s_base)
-        # When res_alpha→0: s≈s_base (vanilla xPatch)
-        # When res_alpha→1: s≈s_gated (full gating)
+        # [GLCN] Post-pointwise gating with learnable blend
+        s_post = s
+        s_gated_post = self.gate_post(s)
+        s = s_post + self.alpha_post * (s_gated_post - s_post)
 
         # Flatten Head
         s = self.flatten1(s)
