@@ -29,18 +29,19 @@ class InterPatchGating(nn.Module):
 
 class GLPatchNetwork(nn.Module):
     """
-    GLPatch v6 dual-stream network.
+    GLPatch v7 dual-stream network.
     
-    v6 fix over v5:
-    - CONSTRAINED fusion gate to [0.2, 0.8] — prevents degenerate collapse
-      where one stream is fully suppressed (caused ETTh1-720 catastrophe)
-    - Gate biases initialized to 0 → sigmoid(0)=0.5 → starts at equal
-      weighting, matching xPatch's balanced combination
-    - Gate weights initialized with small std for stability
+    v7 change vs v6:
+    - WIDER gate constraint: [0.1, 0.9] instead of [0.2, 0.8]
+    - v6's [0.2, 0.8] was too rigid for ETTh2 (0/4 wins)
+    - v5's unconstrained [0,1] caused ETTh1-720 collapse (+0.047)
+    - [0.1, 0.9] is the middle ground: prevents full stream suppression
+      while giving enough freedom for ETTh2's optimal balance
     
-    Architecture unchanged from v5:
+    Everything else identical to v6:
     1. Pre-pointwise inter-patch gating (alpha=0.05)
     2. Adaptive stream fusion with constrained gate
+    3. Small weight init (std=0.01), zero bias init
     """
     def __init__(self, seq_len, pred_len, patch_len, stride, padding_patch):
         super(GLPatchNetwork, self).__init__()
@@ -105,15 +106,12 @@ class GLPatchNetwork(nn.Module):
         self.fc7 = nn.Linear(pred_len // 2, pred_len)
 
         # ================================================================
-        # Constrained Adaptive Stream Fusion (v6)
+        # Constrained Adaptive Stream Fusion (v7: wider [0.1, 0.9])
         # ================================================================
-        # Gate projects from both streams to produce per-timestep weights
         self.gate_s = nn.Linear(pred_len, pred_len)
         self.gate_t = nn.Linear(pred_len, pred_len)
 
-        # Initialize for stability:
-        # - Small weights so gate inputs start near 0
-        # - Zero bias so sigmoid(0)=0.5 → equal weighting at init
+        # Initialize for stability
         nn.init.normal_(self.gate_s.weight, std=0.01)
         nn.init.normal_(self.gate_t.weight, std=0.01)
         nn.init.zeros_(self.gate_s.bias)
@@ -142,7 +140,6 @@ class GLPatchNetwork(nn.Module):
         if self.padding_patch == 'end':
             s = self.padding_patch_layer(s)
         s = s.unfold(dimension=-1, size=self.patch_len, step=self.stride)
-        # s: [B*C, patch_num, patch_len]
 
         # Patch Embedding
         s = self.fc1(s)
@@ -175,7 +172,6 @@ class GLPatchNetwork(nn.Module):
         s = self.fc3(s)
         s = self.gelu4(s)
         s = self.fc4(s)
-        # s: [B*C, pred_len]
 
         # ---- Linear Stream (identical to xPatch) ----
 
@@ -188,18 +184,12 @@ class GLPatchNetwork(nn.Module):
         t = self.ln2(t)
 
         t = self.fc7(t)
-        # t: [B*C, pred_len]
 
         # ---- Constrained Adaptive Stream Fusion ----
-        # Compute input-dependent gate, then clamp to [0.2, 0.8]
-        # to prevent full suppression of either stream
-        gate = torch.sigmoid(self.gate_s(s) + self.gate_t(t))  # [B*C, pred_len]
-        gate = gate * 0.6 + 0.2  # remap from [0,1] to [0.2, 0.8]
+        gate = torch.sigmoid(self.gate_s(s) + self.gate_t(t))
+        gate = gate * 0.8 + 0.1  # remap [0,1] → [0.1, 0.9]
 
-        # Dynamically blend: gate→0.8 favors seasonality, gate→0.2 favors trend
         x = gate * s + (1 - gate) * t
-
-        # Refine the combined output
         x = self.fc8(x)
 
         # Channel concatenation
