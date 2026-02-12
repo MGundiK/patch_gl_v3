@@ -29,19 +29,26 @@ class InterPatchGating(nn.Module):
 
 class GLPatchNetwork(nn.Module):
     """
-    GLPatch v7 dual-stream network.
+    GLPatch v8 dual-stream network.
     
-    v7 change vs v6:
-    - WIDER gate constraint: [0.1, 0.9] instead of [0.2, 0.8]
-    - v6's [0.2, 0.8] was too rigid for ETTh2 (0/4 wins)
-    - v5's unconstrained [0,1] caused ETTh1-720 collapse (+0.047)
-    - [0.1, 0.9] is the middle ground: prevents full stream suppression
-      while giving enough freedom for ETTh2's optimal balance
+    Root cause diagnosis for ETTh2 long-horizon failures:
+    In v5-v7, gate_s and gate_t are Linear(pred_len, pred_len).
+    At pred_len=720: each is 720×720 = 518K params → ~1M total for the gate.
+    At pred_len=96: each is 96×96 = 9K params → ~18K total.
+    That's 55x more gate params at 720 vs 96 — massive overfitting on small
+    datasets like ETTh2 at long horizons.
     
-    Everything else identical to v6:
+    v8 fix: BOTTLENECK fusion gate with fixed hidden dim (32).
+    - Gate: s,t → shared hidden (32) → gate weights (pred_len)
+    - pred_len=720: ~69K total gate params (vs ~1M in v7) = 15x reduction
+    - pred_len=96: ~9K total (similar to v7)
+    - The bottleneck forces the gate to learn COARSE-GRAINED stream
+      weighting patterns rather than per-timestep noise
+    
+    Everything else unchanged from v7:
     1. Pre-pointwise inter-patch gating (alpha=0.05)
-    2. Adaptive stream fusion with constrained gate
-    3. Small weight init (std=0.01), zero bias init
+    2. Constrained gate range [0.1, 0.9]
+    3. Small weight init, zero bias init
     """
     def __init__(self, seq_len, pred_len, patch_len, stride, padding_patch):
         super(GLPatchNetwork, self).__init__()
@@ -106,16 +113,25 @@ class GLPatchNetwork(nn.Module):
         self.fc7 = nn.Linear(pred_len // 2, pred_len)
 
         # ================================================================
-        # Constrained Adaptive Stream Fusion (v7: wider [0.1, 0.9])
+        # Bottleneck Adaptive Stream Fusion (v8)
         # ================================================================
-        self.gate_s = nn.Linear(pred_len, pred_len)
-        self.gate_t = nn.Linear(pred_len, pred_len)
+        # Fixed hidden dim regardless of pred_len — prevents
+        # overparameterization at long horizons
+        gate_hidden = min(32, pred_len)
+
+        # Compress both streams into shared low-dim space
+        self.gate_compress_s = nn.Linear(pred_len, gate_hidden)
+        self.gate_compress_t = nn.Linear(pred_len, gate_hidden)
+        # Expand back to per-timestep gate weights
+        self.gate_expand = nn.Linear(gate_hidden, pred_len)
 
         # Initialize for stability
-        nn.init.normal_(self.gate_s.weight, std=0.01)
-        nn.init.normal_(self.gate_t.weight, std=0.01)
-        nn.init.zeros_(self.gate_s.bias)
-        nn.init.zeros_(self.gate_t.bias)
+        nn.init.normal_(self.gate_compress_s.weight, std=0.01)
+        nn.init.normal_(self.gate_compress_t.weight, std=0.01)
+        nn.init.normal_(self.gate_expand.weight, std=0.01)
+        nn.init.zeros_(self.gate_compress_s.bias)
+        nn.init.zeros_(self.gate_compress_t.bias)
+        nn.init.zeros_(self.gate_expand.bias)
 
         # Final projection
         self.fc8 = nn.Linear(pred_len, pred_len)
@@ -185,9 +201,14 @@ class GLPatchNetwork(nn.Module):
 
         t = self.fc7(t)
 
-        # ---- Constrained Adaptive Stream Fusion ----
-        gate = torch.sigmoid(self.gate_s(s) + self.gate_t(t))
-        gate = gate * 0.8 + 0.1  # remap [0,1] → [0.1, 0.9]
+        # ---- Bottleneck Adaptive Stream Fusion ----
+        # Compress to low-dim, combine, expand back
+        gate = torch.sigmoid(
+            self.gate_expand(
+                self.gate_compress_s(s) + self.gate_compress_t(t)
+            )
+        )
+        gate = gate * 0.8 + 0.1  # constrain to [0.1, 0.9]
 
         x = gate * s + (1 - gate) * t
         x = self.fc8(x)
