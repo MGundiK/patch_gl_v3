@@ -29,25 +29,29 @@ class InterPatchGating(nn.Module):
 
 class GLPatchNetwork(nn.Module):
     """
-    GLPatch v4 dual-stream network.
+    GLPatch v5 dual-stream network.
     
-    Key insight from v2 vs v3: gating BEFORE pointwise conv helped ETTh2
-    long horizons; gating AFTER pointwise conv helped ETTm1 and Exchange.
-    The optimal position is dataset-dependent.
+    Two targeted improvements over xPatch:
     
-    v4 solution: dual gating at BOTH positions, each with its own learnable
-    alpha. The model discovers which position matters per dataset.
+    1. PRE-POINTWISE INTER-PATCH GATING (from v2, our best module)
+       - Conservative alpha=0.05 to stay close to xPatch baseline
+       - Learns which temporal patches carry more predictive information
+       - Demonstrated wins at long horizons across v2/v3/v4
     
-    v4 changes vs v3:
-    1. DUAL GATING — gate_pre (before pointwise) + gate_post (after pointwise)
-    2. INDEPENDENT alphas — alpha_pre and alpha_post, both init 0.1
-    3. Minimal param increase — two small MLPs (patch_num → patch_num/4 → patch_num)
-       plus two scalars. Still very close to xPatch in size.
+    2. ADAPTIVE STREAM FUSION (new in v5)
+       - xPatch uses fixed `cat → Linear` to combine seasonal + trend streams
+       - This learns a STATIC weight per output timestep during training
+       - v5 adds an input-dependent gate: for each sample, dynamically
+         weights how much seasonality vs trend matters
+       - Some inputs are trend-dominated (gate → 0), others are
+         seasonality-dominated (gate → 1)
+       - Implemented as: gate = σ(Ws·s + Wt·t), out = gate⊙s + (1-gate)⊙t
+       - Then the existing fc8 refines the combined output
     
-    Architecture (seasonality stream):
-        Patching → Embedding → Depthwise+Residual →
-        [Pre-gating with alpha_pre] → Pointwise →
-        [Post-gating with alpha_post] → Flatten Head
+    v5 changes vs v4:
+    - REMOVED dual gating (caused instability on ETTh1-720)
+    - SINGLE pre-pointwise gate with conservative alpha=0.05
+    - ADDED adaptive stream fusion (new mechanism, different weakness targeted)
     """
     def __init__(self, seq_len, pred_len, patch_len, stride, padding_patch):
         super(GLPatchNetwork, self).__init__()
@@ -83,20 +87,14 @@ class GLPatchNetwork(nn.Module):
         # Residual Stream (from xPatch)
         self.fc2 = nn.Linear(self.dim, patch_len)
 
-        # [GLCN] Pre-pointwise gating — gates on per-patch features
-        # Helps ETTh2 long horizons (v2 evidence)
-        self.gate_pre = InterPatchGating(self.patch_num, reduction=4)
-        self.alpha_pre = nn.Parameter(torch.tensor(0.1))
+        # [GLCN] Pre-pointwise gating with conservative alpha
+        self.inter_patch_gate = InterPatchGating(self.patch_num, reduction=4)
+        self.res_alpha = nn.Parameter(torch.tensor(0.05))
 
         # CNN Pointwise (from xPatch)
         self.conv2 = nn.Conv1d(self.patch_num, self.patch_num, 1, 1)
         self.gelu3 = nn.GELU()
         self.bn3 = nn.BatchNorm1d(self.patch_num)
-
-        # [GLCN] Post-pointwise gating — gates on aggregated features
-        # Helps ETTm1, Exchange (v3 evidence)
-        self.gate_post = InterPatchGating(self.patch_num, reduction=4)
-        self.alpha_post = nn.Parameter(torch.tensor(0.1))
 
         # Flatten Head (from xPatch)
         self.flatten1 = nn.Flatten(start_dim=-2)
@@ -118,9 +116,14 @@ class GLPatchNetwork(nn.Module):
         self.fc7 = nn.Linear(pred_len // 2, pred_len)
 
         # ================================================================
-        # Streams Concatenation
+        # Adaptive Stream Fusion (new in v5)
         # ================================================================
-        self.fc8 = nn.Linear(pred_len * 2, pred_len)
+        # Input-dependent gate that dynamically weights seasonal vs trend
+        # predictions per sample. Replaces xPatch's fixed linear combination.
+        self.gate_s = nn.Linear(pred_len, pred_len)
+        self.gate_t = nn.Linear(pred_len, pred_len)
+        # Final projection (same as xPatch fc8)
+        self.fc8 = nn.Linear(pred_len, pred_len)
 
     def forward(self, s, t):
         # s: seasonality [Batch, Input, Channel]
@@ -162,26 +165,21 @@ class GLPatchNetwork(nn.Module):
         # s: [B*C, patch_num, patch_len]
 
         # [GLCN] Pre-pointwise gating with learnable blend
-        s_pre = s
-        s_gated_pre = self.gate_pre(s)
-        s = s_pre + self.alpha_pre * (s_gated_pre - s_pre)
+        s_base = s
+        s_gated = self.inter_patch_gate(s)
+        s = s_base + self.res_alpha * (s_gated - s_base)
 
         # CNN Pointwise
         s = self.conv2(s)
         s = self.gelu3(s)
         s = self.bn3(s)
-        # s: [B*C, patch_num, patch_len]
-
-        # [GLCN] Post-pointwise gating with learnable blend
-        s_post = s
-        s_gated_post = self.gate_post(s)
-        s = s_post + self.alpha_post * (s_gated_post - s_post)
 
         # Flatten Head
         s = self.flatten1(s)
         s = self.fc3(s)
         s = self.gelu4(s)
         s = self.fc4(s)
+        # s: [B*C, pred_len]
 
         # ---- Linear Stream (identical to xPatch) ----
 
@@ -194,9 +192,14 @@ class GLPatchNetwork(nn.Module):
         t = self.ln2(t)
 
         t = self.fc7(t)
+        # t: [B*C, pred_len]
 
-        # ---- Streams Concatenation ----
-        x = torch.cat((s, t), dim=1)
+        # ---- Adaptive Stream Fusion ----
+        # Compute input-dependent gate per timestep
+        gate = torch.sigmoid(self.gate_s(s) + self.gate_t(t))  # [B*C, pred_len]
+        # Dynamically blend: gate=1 → seasonality, gate=0 → trend
+        x = gate * s + (1 - gate) * t
+        # Refine the combined output
         x = self.fc8(x)
 
         # Channel concatenation
