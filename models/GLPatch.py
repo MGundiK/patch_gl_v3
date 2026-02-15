@@ -3,9 +3,9 @@ import torch.nn as nn
 
 from layers.decomp import DECOMP
 # from layers.network_glpatch_v5 import GLPatchNetwork # use version 5
-from layers.network_glpatch_v9 import GLPatchNetwork # use version 9
+# from layers.network_glpatch_v9 import GLPatchNetwork # use version 9
 
-# from layers.network_glpatch import GLPatchNetwork # use latest version
+from layers.network_glpatch import GLPatchNetwork # use  version 8
 from layers.revin import RevIN
 
 
