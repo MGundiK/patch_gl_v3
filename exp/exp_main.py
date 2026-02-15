@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch import optim
+from torch.cuda.amp import autocast, GradScaler
 import os
 import time
 import warnings
@@ -58,13 +59,18 @@ class Exp_Main(Exp_Basic):
                 # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
-                outputs = self.model(batch_x)
+
+                # encoder - decoder (AMP for inference too)
+                if self.args.use_amp:
+                    with autocast():
+                        outputs = self.model(batch_x)
+                else:
+                    outputs = self.model(batch_x)
+
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
 
-                # if train, use ratio to scale the prediction
                 if not is_test:
                     # Arctangent loss with weight decay
                     self.ratio = np.array([-1 * math.atan(i+1) + math.pi/4 + 1 for i in range(self.args.pred_len)])
@@ -100,6 +106,10 @@ class Exp_Main(Exp_Basic):
         model_optim = self._select_optimizer()
         mse_criterion, mae_criterion = self._select_criterion()
 
+        # AMP GradScaler for mixed precision training
+        if self.args.use_amp:
+            scaler = GradScaler()
+
         for epoch in range(self.args.train_epochs):
             iter_count = 0
             train_loss = []
@@ -119,33 +129,64 @@ class Exp_Main(Exp_Basic):
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
 
-                # encoder - decoder
-                outputs = self.model(batch_x)
-                f_dim = -1 if self.args.features == 'MS' else 0
-                outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                if self.args.use_amp:
+                    with autocast():
+                        # encoder - decoder
+                        outputs = self.model(batch_x)
+                        f_dim = -1 if self.args.features == 'MS' else 0
+                        outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
 
-                # Arctangent loss with weight decay
-                self.ratio = np.array([-1 * math.atan(i+1) + math.pi/4 + 1 for i in range(self.args.pred_len)])
-                self.ratio = torch.tensor(self.ratio).unsqueeze(-1).to(self.device)
+                        # Arctangent loss with weight decay
+                        self.ratio = np.array([-1 * math.atan(i+1) + math.pi/4 + 1 for i in range(self.args.pred_len)])
+                        self.ratio = torch.tensor(self.ratio).unsqueeze(-1).to(self.device)
 
-                outputs = outputs * self.ratio
-                batch_y = batch_y * self.ratio
+                        outputs = outputs * self.ratio
+                        batch_y = batch_y * self.ratio
 
-                loss = mae_criterion(outputs, batch_y)
+                        loss = mae_criterion(outputs, batch_y)
 
-                train_loss.append(loss.item())
+                    train_loss.append(loss.item())
 
-                if (i + 1) % 100 == 0:
-                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
-                    speed = (time.time() - time_now) / iter_count
-                    left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
-                    print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
-                    iter_count = 0
-                    time_now = time.time()
+                    if (i + 1) % 100 == 0:
+                        print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                        speed = (time.time() - time_now) / iter_count
+                        left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
+                        print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+                        iter_count = 0
+                        time_now = time.time()
 
-                loss.backward()
-                model_optim.step()
+                    scaler.scale(loss).backward()
+                    scaler.step(model_optim)
+                    scaler.update()
+                else:
+                    # encoder - decoder
+                    outputs = self.model(batch_x)
+                    f_dim = -1 if self.args.features == 'MS' else 0
+                    outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+
+                    # Arctangent loss with weight decay
+                    self.ratio = np.array([-1 * math.atan(i+1) + math.pi/4 + 1 for i in range(self.args.pred_len)])
+                    self.ratio = torch.tensor(self.ratio).unsqueeze(-1).to(self.device)
+
+                    outputs = outputs * self.ratio
+                    batch_y = batch_y * self.ratio
+
+                    loss = mae_criterion(outputs, batch_y)
+
+                    train_loss.append(loss.item())
+
+                    if (i + 1) % 100 == 0:
+                        print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                        speed = (time.time() - time_now) / iter_count
+                        left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
+                        print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+                        iter_count = 0
+                        time_now = time.time()
+
+                    loss.backward()
+                    model_optim.step()
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
@@ -193,8 +234,13 @@ class Exp_Main(Exp_Basic):
                 # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
-                outputs = self.model(batch_x)
+
+                # encoder - decoder (AMP for inference)
+                if self.args.use_amp:
+                    with autocast():
+                        outputs = self.model(batch_x)
+                else:
+                    outputs = self.model(batch_x)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
