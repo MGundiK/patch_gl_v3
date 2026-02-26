@@ -65,10 +65,14 @@ parser.add_argument('--lradj', type=str, default='type1', help='adjust learning 
 parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 parser.add_argument('--revin', type=int, default=1, help='RevIN; True 1 False 0')
 # parser.add_argument('--warmup_epochs',type=int,default = 0)
+
+# cv mixing
 parser.add_argument('--cv_mixing', type=str, default='none',
                     help='Cross-variable mixing: none, hydra, hydra_bottleneck, hydra_gated')
 parser.add_argument('--cv_rank', type=int, default=32,
                     help='Bottleneck rank for hydra_bottleneck variant')
+parser.add_argument('--cv_placement', type=str, default='post_pw',
+                    help='Hydra insertion point: post_embed, post_pw, post_stream, post_fusion')
 
 # GPU
 parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
