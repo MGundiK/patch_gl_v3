@@ -1,12 +1,16 @@
 #!/bin/bash
 # ============================================================================
-# GLPatch_Hydra Experiments — Phase 1: Weather (21v)
+# GLPatch_Hydra v2 — Weather Placement Experiment
 # ============================================================================
-# Weather is the #1 priority: AdaPatch's MLP mixing gets −5.5% vs GLPatch here.
-# If Hydra can match or beat that, it validates the approach.
+# v1 showed Hydra at post_embed (raw patch embeddings) barely helps.
+# v2 tests 3 later placements where representations are richer:
 #
-# Uses SAME hyperparameters as your GLPatch Weather runs.
-# Only varies: --model, --cv_mixing, --cv_rank
+#   post_pw:      After pointwise conv — dim=16, patches carry extracted features
+#   post_stream:  After seasonal head  — dim=pred_len, full temporal prediction
+#   post_fusion:  After stream fusion  — dim=pred_len, combined s+t prediction
+#
+# Uses hydra_gated only (best variant from v1). Rank auto-clipped per dim.
+# Same hyperparameters as GLPatch Weather runs.
 # ============================================================================
 
 MODEL="GLPatch_Hydra"
@@ -20,7 +24,6 @@ FEATURES="M"
 PATCH_LEN=16
 STRIDE=8
 
-# Hyperparameters matching your reference Weather settings
 BATCH_SIZE=2048
 LR=0.0005
 LRADJ="sigmoid"
@@ -37,60 +40,64 @@ COMMON_ARGS="--is_training 1 \
   --train_epochs $EPOCHS --patience $PATIENCE \
   --revin 1 --use_amp"
 
-
 echo "============================================================"
-echo " Phase 1: Weather — Hydra variant comparison"
+echo " GLPatch_Hydra v2 — Weather Placement Comparison"
+echo " Using hydra_gated, rank=32 (auto-clipped per placement)"
 echo "============================================================"
 
 for PRED_LEN in 96 192 336 720; do
   echo ""
   echo "=== Weather T=${PRED_LEN} ==="
 
-  # Experiment 1: GLPatch_Hydra with cv_mixing=none (should match GLPatch exactly)
-  echo "--- Baseline: cv_mixing=none ---"
+  # Baseline: no mixing (= GLPatch)
+  echo "--- none (baseline) ---"
   python run.py \
-    --model $MODEL --model_id "Weather_${PRED_LEN}_hydra_none" \
+    --model $MODEL --model_id "W${PRED_LEN}_v2_none" \
     --pred_len $PRED_LEN \
     --cv_mixing none \
-    --des "hydra_none" \
+    --des "v2_none" \
     $COMMON_ARGS
 
-  # Experiment 2: hydra (full-dim, simplest)
-  echo "--- hydra (full-dim) ---"
+  # post_pw: After pointwise conv, dim=16, rank auto-clipped to 8
+  echo "--- hydra_gated @ post_pw (dim=16) ---"
   python run.py \
-    --model $MODEL --model_id "Weather_${PRED_LEN}_hydra_full" \
+    --model $MODEL --model_id "W${PRED_LEN}_v2_postpw" \
     --pred_len $PRED_LEN \
-    --cv_mixing hydra \
-    --des "hydra_full" \
+    --cv_mixing hydra_gated --cv_rank 32 --cv_placement post_pw \
+    --des "v2_postpw" \
     $COMMON_ARGS
 
-  # Experiment 3: hydra_bottleneck r=32 (closest to AdaPatch MLP r=32)
-  echo "--- hydra_bottleneck r=32 ---"
+  # post_stream: After seasonal head, dim=pred_len
+  echo "--- hydra_gated @ post_stream (dim=${PRED_LEN}) ---"
   python run.py \
-    --model $MODEL --model_id "Weather_${PRED_LEN}_hydra_bn32" \
+    --model $MODEL --model_id "W${PRED_LEN}_v2_poststream" \
     --pred_len $PRED_LEN \
-    --cv_mixing hydra_bottleneck --cv_rank 32 \
-    --des "hydra_bn32" \
+    --cv_mixing hydra_gated --cv_rank 32 --cv_placement post_stream \
+    --des "v2_poststream" \
     $COMMON_ARGS
 
-  # Experiment 4: hydra_gated r=32 (recommended — gating filters noise)
-  echo "--- hydra_gated ---"
+  # post_fusion: After gate fusion, dim=pred_len
+  echo "--- hydra_gated @ post_fusion (dim=${PRED_LEN}) ---"
   python run.py \
-    --model $MODEL --model_id "Weather_${PRED_LEN}_hydra_gated" \
+    --model $MODEL --model_id "W${PRED_LEN}_v2_postfusion" \
     --pred_len $PRED_LEN \
-    --cv_mixing hydra_gated \
-    --des "hydra_gated" \
+    --cv_mixing hydra_gated --cv_rank 32 --cv_placement post_fusion \
+    --des "v2_postfusion" \
     $COMMON_ARGS
 
 done
 
 echo ""
 echo "============================================================"
-echo " Weather experiments complete. Check result.txt for MSE/MAE."
+echo " Done. Compare with:"
+echo "   grep 'v2_' result.txt"
+echo ""
+echo " Expected dims & effective ranks:"
+echo "   post_pw:     dim=16,  rank=8  (auto-clipped from 32)"
+echo "   post_stream: dim=T,   rank=32 (or T//2 if T<64)"
+echo "   post_fusion: dim=T,   rank=32 (or T//2 if T<64)"
+echo ""
+echo " GLPatch baselines (from your runs):"
+echo "   T=96:  0.1658    T=192: 0.2092"
+echo "   T=336: 0.2349    T=720: 0.3079"
 echo "============================================================"
-echo ""
-echo "Expected comparisons (Weather avg MSE):"
-echo "  GLPatch (CI):          0.229"
-echo "  AdaPatch (MLP r=32):   0.217  (−5.5%)"
-echo "  Hydra target:         <0.217  (beat AdaPatch)"
-echo ""
