@@ -151,7 +151,10 @@ class GLPatchHydraNetwork(nn.Module):
                 raise ValueError(f"Unknown cv_placement: {cv_placement}")
 
             # Auto-clip rank: can't exceed feature dim, use half at most
-            effective_rank = min(cv_rank, max(hydra_dim // 2, 4))
+            #effective_rank = min(cv_rank, max(hydra_dim // 2, 4))
+            # removed clipping
+            effective_rank = min(cv_rank, hydra_dim)
+
 
             self.hydra = HydraChannelMixer(
                 d_model=hydra_dim,
