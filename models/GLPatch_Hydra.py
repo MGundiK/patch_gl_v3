@@ -1,12 +1,13 @@
 """
-GLPatch_Hydra: GLPatch with Hydra cross-variable mixing (v2).
+GLPatch_Hydra v3: Universal architecture with adaptive gating.
 
-Drop-in replacement for GLPatch. New args:
-  --cv_mixing:    none | hydra | hydra_bottleneck | hydra_gated
-  --cv_rank:      Bottleneck rank (default 32, auto-clipped per placement)
-  --cv_placement: post_embed | post_pw | post_stream | post_fusion
+Hydra is always on. The gate learns whether to use it.
+No more cv_mixing='none' vs 'hydra_gated' decision.
 
-Recommended: --cv_mixing hydra_gated --cv_placement post_pw
+Args:
+  --cv_rank:      Bottleneck rank (default 32)
+  --gate_type:    'scalar', 'vector', 'adaptive' (default 'adaptive')
+  --gate_init:    Initial sigmoid bias (default -5.0)
 """
 
 import torch
@@ -38,16 +39,16 @@ class Model(nn.Module):
 
         self.decomp = DECOMP(self.ma_type, alpha, beta)
 
-        # Hydra config (safe defaults — 'none' = plain GLPatch)
-        cv_mixing = getattr(configs, 'cv_mixing', 'none')
+        # Hydra config (universal — no on/off switch)
         cv_rank = getattr(configs, 'cv_rank', 32)
-        cv_placement = getattr(configs, 'cv_placement', 'post_pw')
+        gate_type = getattr(configs, 'gate_type', 'adaptive')
+        gate_init = getattr(configs, 'gate_init', -5.0)
 
         self.net = GLPatchHydraNetwork(
             seq_len, pred_len, patch_len, stride, padding_patch,
-            cv_mixing=cv_mixing,
             cv_rank=cv_rank,
-            cv_placement=cv_placement,
+            gate_type=gate_type,
+            gate_init=gate_init,
             n_channels=c_in,
         )
 
