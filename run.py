@@ -67,12 +67,13 @@ parser.add_argument('--revin', type=int, default=1, help='RevIN; True 1 False 0'
 # parser.add_argument('--warmup_epochs',type=int,default = 0)
 
 # cv mixing
-parser.add_argument('--cv_mixing', type=str, default='none',
-                    help='Cross-variable mixing: none, hydra, hydra_bottleneck, hydra_gated')
 parser.add_argument('--cv_rank', type=int, default=32,
-                    help='Bottleneck rank for hydra_bottleneck variant')
-parser.add_argument('--cv_placement', type=str, default='post_pw',
-                    help='Hydra insertion point: post_embed, post_pw, post_stream, post_fusion')
+                    help='Hydra bottleneck rank')
+parser.add_argument('--gate_type', type=str, default='adaptive',
+                    choices=['scalar', 'vector', 'adaptive'],
+                    help='Adaptive gate type for Hydra mixing')
+parser.add_argument('--gate_init', type=float, default=-5.0,
+                    help='Initial gate bias (sigmoid(-5)=0.7%, -3=5%, 0=50%)')
 
 # GPU
 parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
