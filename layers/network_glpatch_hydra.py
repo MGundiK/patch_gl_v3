@@ -1,14 +1,17 @@
 """
-GLPatch v8 network WITH Hydra cross-variable mixing — v2.
+GLPatch v3 network — Hydra with Adaptive Gating.
 
-v2 changes from v1:
-  - Multiple placement options via cv_placement argument
-  - 'post_embed':   After patch embedding (v1 location — too early, kept for reference)
-  - 'post_pw':      After pointwise conv — RECOMMENDED, matches AdaPatch's successful ppw
-  - 'post_stream':  After seasonal flatten head, before fusion
-  - 'post_fusion':  After stream fusion, before final projection
-  - Auto-sets d_model based on placement (no user error possible)
-  - Auto-clips rank to not exceed feature dim
+Key change: Hydra is ALWAYS ON. No cv_mixing='none' needed.
+The adaptive gate learns to shut off mixing when it doesn't help.
+
+This eliminates the dataset-dependent on/off decision.
+One architecture, one config, universal.
+
+Args (simplified from v2):
+    cv_rank:      Bottleneck rank (default 32, universal)
+    gate_type:    'scalar', 'vector', 'adaptive' (default 'adaptive')
+    gate_init:    Initial sigmoid bias (default -5.0 ≈ 0.7% mixing)
+    n_channels:   Number of input variables
 """
 
 import torch
@@ -38,24 +41,17 @@ class InterPatchGating(nn.Module):
 
 class GLPatchHydraNetwork(nn.Module):
     """
-    GLPatch v8 dual-stream + Hydra cross-variable mixing (v2).
+    GLPatch v8 dual-stream + always-on Hydra with adaptive gating.
 
-    Args (new vs GLPatchNetwork):
-        cv_mixing:    'none' | 'hydra' | 'hydra_bottleneck' | 'hydra_gated'
-        cv_rank:      Bottleneck rank. Auto-clipped to not exceed feature dim.
-        cv_placement: Where to insert cross-variable mixing:
-                      'post_embed'  — after patch embedding (dim=256, v1 default)
-                      'post_pw'     — after pointwise conv (dim=16) ← RECOMMENDED
-                      'post_stream' — after seasonal head (dim=pred_len)
-                      'post_fusion' — after stream fusion (dim=pred_len)
-        n_channels:   Number of input variables (enc_in).
+    The model decides FOR ITSELF how much cross-variable mixing to use.
+    On ETTm1 (C=7), the gate learns to stay near zero.
+    On Electricity (C=321), the gate opens to mix aggressively.
     """
     def __init__(self, seq_len, pred_len, patch_len, stride, padding_patch,
-                 cv_mixing='none', cv_rank=32, cv_placement='post_pw',
+                 cv_rank=32, gate_type='adaptive', gate_init=-5.0,
                  n_channels=7):
         super(GLPatchHydraNetwork, self).__init__()
 
-        # Parameters
         self.pred_len = pred_len
         self.patch_len = patch_len
         self.stride = stride
@@ -75,25 +71,20 @@ class GLPatchHydraNetwork(nn.Module):
         self.gelu1 = nn.GELU()
         self.bn1 = nn.BatchNorm1d(self.patch_num)
 
-        # CNN Depthwise (from xPatch)
         self.conv1 = nn.Conv1d(self.patch_num, self.patch_num,
                                patch_len, patch_len, groups=self.patch_num)
         self.gelu2 = nn.GELU()
         self.bn2 = nn.BatchNorm1d(self.patch_num)
 
-        # Residual Stream (from xPatch)
         self.fc2 = nn.Linear(self.dim, patch_len)
 
-        # [GLCN] Pre-pointwise gating
         self.inter_patch_gate = InterPatchGating(self.patch_num, reduction=4)
         self.res_alpha = nn.Parameter(torch.tensor(0.05))
 
-        # CNN Pointwise (from xPatch)
         self.conv2 = nn.Conv1d(self.patch_num, self.patch_num, 1, 1)
         self.gelu3 = nn.GELU()
         self.bn3 = nn.BatchNorm1d(self.patch_num)
 
-        # Flatten Head (from xPatch)
         self.flatten1 = nn.Flatten(start_dim=-2)
         self.fc3 = nn.Linear(self.patch_num * patch_len, pred_len * 2)
         self.gelu4 = nn.GELU()
@@ -131,125 +122,67 @@ class GLPatchHydraNetwork(nn.Module):
         self.fc8 = nn.Linear(pred_len, pred_len)
 
         # ================================================================
-        # [HYDRA v2] Cross-Variable Mixing — placement-aware
+        # [HYDRA v3] Always-on with adaptive gating — post-fusion
         # ================================================================
-        self.cv_mixing = cv_mixing
-        self.cv_placement = cv_placement
-        # is_3d: True for placements where tensor is [B*C, P, D]
-        #        False for placements where tensor is [B*C, pred_len] (1D per channel)
-        self.hydra_is_3d = cv_placement in ('post_embed', 'post_pw')
+        # Effective rank: min(cv_rank, pred_len)
+        effective_rank = min(cv_rank, pred_len)
 
-        if cv_mixing != 'none':
-            # Determine feature dimension based on placement
-            if cv_placement == 'post_embed':
-                hydra_dim = self.dim           # patch_len² = 256
-            elif cv_placement == 'post_pw':
-                hydra_dim = patch_len          # 16
-            elif cv_placement in ('post_stream', 'post_fusion'):
-                hydra_dim = pred_len           # 96/192/336/720
-            else:
-                raise ValueError(f"Unknown cv_placement: {cv_placement}")
+        self.hydra = HydraChannelMixer(
+            d_model=pred_len,
+            variant='hydra_gated',
+            rank=effective_rank,
+            dropout=0.0,
+            gate_type=gate_type,
+            gate_init=gate_init,
+        )
 
-            # Auto-clip rank: can't exceed feature dim, use half at most
-            #effective_rank = min(cv_rank, max(hydra_dim // 2, 4))
-            # removed clipping
-            effective_rank = min(cv_rank, hydra_dim)
-
-
-            self.hydra = HydraChannelMixer(
-                d_model=hydra_dim,
-                variant=cv_mixing,
-                rank=effective_rank,
-                dropout=0.0,
-                residual_scale=0.1,
-            )
-
-            print(f"[GLPatch_Hydra v2] {cv_mixing} @ {cv_placement}, "
-                  f"d_model={hydra_dim}, rank={effective_rank}, C={n_channels}")
-        else:
-            self.hydra = None
-
-    def _apply_hydra_3d(self, x, B, C):
-        """Apply Hydra on 3D tensor [B*C, P, D] — for post_embed and post_pw."""
-        return self.hydra(x, B, C)
-
-    def _apply_hydra_1d(self, x, B, C):
-        """Apply Hydra on 1D tensor [B*C, pred_len] — for post_stream/post_fusion.
-        Reshapes to [B, C, pred_len] so Hydra treats each channel as a token
-        with pred_len features, then reshapes back."""
-        # [B*C, pred_len] → [B, C, 1, pred_len] — fake patch dim of 1
-        h = x.reshape(B, C, 1, -1)
-        # Flatten back for the HydraChannelMixer interface: [B*C, 1, pred_len]
-        h_flat = h.reshape(B * C, 1, -1)
-        h_out = self.hydra(h_flat, B, C)
-        return h_out.reshape(B * C, -1)
+        print(f"[GLPatch_Hydra v3] ALWAYS-ON hydra_gated @ post_fusion, "
+              f"d_model={pred_len}, rank={effective_rank}, C={n_channels}, "
+              f"gate={gate_type} (init={gate_init})")
 
     def forward(self, s, t):
-        # s: seasonality [Batch, Input, Channel]
-        # t: trend       [Batch, Input, Channel]
-
-        s = s.permute(0, 2, 1)  # to [Batch, Channel, Input]
+        s = s.permute(0, 2, 1)
         t = t.permute(0, 2, 1)
 
         B = s.shape[0]
         C = s.shape[1]
         I = s.shape[2]
-        s = torch.reshape(s, (B * C, I))  # [B*C, I]
+        s = torch.reshape(s, (B * C, I))
         t = torch.reshape(t, (B * C, I))
 
         # ---- Non-linear Stream ----
 
-        # Patching
         if self.padding_patch == 'end':
             s = self.padding_patch_layer(s)
         s = s.unfold(dimension=-1, size=self.patch_len, step=self.stride)
-        # s: [B*C, patch_num, patch_len]
 
-        # Patch Embedding
-        s = self.fc1(s)    # [B*C, patch_num, dim=256]
+        s = self.fc1(s)
         s = self.gelu1(s)
         s = self.bn1(s)
 
-        # [HYDRA] post_embed placement (v1 — kept for comparison)
-        if self.hydra is not None and self.cv_placement == 'post_embed':
-            s = self._apply_hydra_3d(s, B, C)
-
         res = s
 
-        # CNN Depthwise
-        s = self.conv1(s)   # [B*C, patch_num, patch_len=16]
+        s = self.conv1(s)
         s = self.gelu2(s)
         s = self.bn2(s)
 
-        # Residual Stream
         res = self.fc2(res)
         s = s + res
 
-        # [GLCN] Pre-pointwise gating
         s_base = s
         s_gated = self.inter_patch_gate(s)
         s = s_base + self.res_alpha * (s_gated - s_base)
 
-        # CNN Pointwise
-        s = self.conv2(s)   # [B*C, patch_num, patch_len=16]
+        s = self.conv2(s)
         s = self.gelu3(s)
         s = self.bn3(s)
 
-        # [HYDRA] post_pw placement — RECOMMENDED
-        if self.hydra is not None and self.cv_placement == 'post_pw':
-            s = self._apply_hydra_3d(s, B, C)
-
-        # Flatten Head
         s = self.flatten1(s)
         s = self.fc3(s)
         s = self.gelu4(s)
-        s = self.fc4(s)    # [B*C, pred_len]
+        s = self.fc4(s)
 
-        # [HYDRA] post_stream placement
-        if self.hydra is not None and self.cv_placement == 'post_stream':
-            s = self._apply_hydra_1d(s, B, C)
-
-        # ---- Linear Stream (identical to xPatch) ----
+        # ---- Linear Stream ----
 
         t = self.fc5(t)
         t = self.avgpool1(t)
@@ -267,17 +200,18 @@ class GLPatchHydraNetwork(nn.Module):
                 self.gate_compress_s(s) + self.gate_compress_t(t)
             )
         )
-        gate = gate * 0.8 + 0.1  # constrain to [0.1, 0.9]
+        gate = gate * 0.8 + 0.1
 
         x = gate * s + (1 - gate) * t
 
-        # [HYDRA] post_fusion placement
-        if self.hydra is not None and self.cv_placement == 'post_fusion':
-            x = self._apply_hydra_1d(x, B, C)
+        # ---- [HYDRA v3] Always-on post-fusion mixing ----
+        # Reshape to [B*C, 1, pred_len] for HydraChannelMixer interface
+        x_3d = x.unsqueeze(1)  # [B*C, 1, pred_len]
+        x_3d = self.hydra(x_3d, B, C)
+        x = x_3d.squeeze(1)    # [B*C, pred_len]
 
         x = self.fc8(x)
 
-        # Channel concatenation
         x = torch.reshape(x, (B, C, self.pred_len))
         x = x.permute(0, 2, 1)
 
