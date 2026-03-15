@@ -1,12 +1,18 @@
 """
-Hydra Attention for Cross-Variable Mixing in Time Series Forecasting.
+Hydra Attention for Cross-Variable Mixing — v3 with Adaptive Gating.
 
-Adapted from: "Hydra Attention: Efficient Attention with Many Heads"
-(Bolya et al., ECCV 2022 Workshops)
+Key change: replaces scalar α with a sigmoid gate initialized cold (near-zero).
+The model must actively learn to open the gate if mixing helps.
 
-Key idea: #heads = feature_dim → each head operates on a scalar.
-Uses L2-normalized cosine similarity instead of softmax.
-Complexity: O(C * D) — linear in both channels and features.
+Gate designs (controlled by gate_type):
+  'scalar':   Single sigmoid(bias), shared across all dims. Cheapest.
+  'vector':   Per-feature sigmoid(bias), different strength per dimension.
+  'adaptive': Gate depends on input cross-channel statistics.
+              Computes channel variance → linear → sigmoid.
+              If channels are correlated/diverse → gate opens.
+              If channels are uniform → gate stays closed.
+
+All gates initialize at ~0.5-1% mixing strength (bias=-5).
 """
 
 import torch
@@ -15,143 +21,187 @@ import torch.nn.functional as F
 
 
 class HydraAttention(nn.Module):
-    """
-    Core Hydra Attention operation.
-    
-    Standard attention: softmax(QK^T / sqrt(d)) V  → O(N²d)
-    Hydra attention:    Q ⊙ Σ_n(K_n ⊙ V_n)        → O(Nd)
-    
-    Uses L2-normalization on Q, K so the operation computes
-    cosine-similarity-weighted aggregation.
-    
-    Args:
-        d_model: Feature dimension per token.
-        dropout: Dropout on output.
-    """
+    """Core Hydra: O(Nd) linear attention via cosine similarity."""
     def __init__(self, d_model, dropout=0.0):
         super().__init__()
-        self.d_model = d_model
         self.W_q = nn.Linear(d_model, d_model, bias=False)
         self.W_k = nn.Linear(d_model, d_model, bias=False)
         self.W_v = nn.Linear(d_model, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
+        Q = F.normalize(self.W_q(x), p=2, dim=-1)
+        K = F.normalize(self.W_k(x), p=2, dim=-1)
+        V = self.W_v(x)
+        global_feat = (K * V).sum(dim=1, keepdim=True)
+        return self.dropout(Q * global_feat)
+
+
+class AdaptiveGate(nn.Module):
+    """
+    Learned gate that controls mixing strength.
+    
+    Starts near-zero so the model defaults to channel-independent.
+    Must learn to open the gate if cross-variable mixing helps.
+    
+    Args:
+        d_model:   Feature dimension
+        gate_type: 'scalar', 'vector', or 'adaptive'
+        init_bias: Initial bias for sigmoid. -5 → ~0.7% mixing.
+    """
+    def __init__(self, d_model, gate_type='adaptive', init_bias=-5.0):
+        super().__init__()
+        self.gate_type = gate_type
+        
+        if gate_type == 'scalar':
+            # Single shared gate value
+            self.bias = nn.Parameter(torch.tensor(init_bias))
+            
+        elif gate_type == 'vector':
+            # Per-feature gate
+            self.bias = nn.Parameter(torch.full((d_model,), init_bias))
+            
+        elif gate_type == 'adaptive':
+            # Gate depends on cross-channel statistics
+            # Input: per-batch channel variance (how diverse are channels?)
+            # High variance → channels carry different info → worth mixing
+            # Low variance → channels are similar → mixing is noise
+            self.gate_net = nn.Sequential(
+                nn.Linear(d_model, d_model // 4),
+                nn.GELU(),
+                nn.Linear(d_model // 4, d_model),
+            )
+            # Initialize output layer to produce values near init_bias
+            nn.init.zeros_(self.gate_net[2].weight)
+            nn.init.constant_(self.gate_net[2].bias, init_bias)
+        else:
+            raise ValueError(f"Unknown gate_type: {gate_type}")
+    
+    def forward(self, x_input, mixed):
         """
         Args:
-            x: [B, N, D]  (N = tokens/channels, D = features)
+            x_input: Original input [B, C, D] (before mixing)
+            mixed:   Hydra output [B, C, D] (after mixing)
         Returns:
-            [B, N, D]  with cross-token information mixed
+            gate:    [scalar, D, or B×1×D] values in (0, 1)
         """
-        Q = F.normalize(self.W_q(x), p=2, dim=-1)   # [B, N, D]
-        K = F.normalize(self.W_k(x), p=2, dim=-1)   # [B, N, D]
-        V = self.W_v(x)                               # [B, N, D]
-
-        # Hydra trick: element-wise K*V, sum across tokens → global vector
-        global_feat = (K * V).sum(dim=1, keepdim=True)  # [B, 1, D]
-
-        # Each token queries the global feature via element-wise product
-        out = Q * global_feat   # [B, N, D]
-        return self.dropout(out)
+        if self.gate_type == 'scalar':
+            return torch.sigmoid(self.bias)
+            
+        elif self.gate_type == 'vector':
+            return torch.sigmoid(self.bias)
+            
+        elif self.gate_type == 'adaptive':
+            # Compute cross-channel variance as signal of diversity
+            # x_input: [B, C, D]
+            chan_var = x_input.var(dim=1)     # [B, D] — variance across channels
+            gate_logits = self.gate_net(chan_var)  # [B, D]
+            return torch.sigmoid(gate_logits).unsqueeze(1)  # [B, 1, D] — broadcast over C
 
 
 class HydraChannelMixer(nn.Module):
     """
-    Cross-variable mixing via Hydra Attention.
+    Cross-variable mixing via Hydra Attention with adaptive gating.
     
-    Designed to slot into a channel-independent pipeline where the
-    channel dim is merged with batch (B*C). Call with the original
-    B and C so it can temporarily un-merge, apply Hydra across C,
-    and re-merge.
-    
-    Operates per-patch-position: reshapes [B, C, P, D] → [B*P, C, D],
-    applies Hydra across C tokens, reshapes back.
-    
-    Variants:
-        'hydra':            Full-dim Hydra on patch embeddings
-        'hydra_bottleneck': Project D→rank, Hydra, project rank→D
-        'hydra_gated':      Hydra + learned sigmoid gate (filters noise)
+    v3 changes from v2:
+      - Replaces scalar α with AdaptiveGate
+      - Gate starts near-zero (~0.7% mixing)
+      - Model learns to open gate only if mixing helps
+      - Works universally: auto-disables on low-C datasets
     
     Args:
-        d_model:        Patch embedding dimension (D = patch_len²).
-        variant:        One of 'hydra', 'hydra_bottleneck', 'hydra_gated'.
-        rank:           Bottleneck rank (only for 'hydra_bottleneck').
-        dropout:        Dropout rate.
-        residual_scale: Initial α for residual blend (small = safe start).
+        d_model:        Feature dim (D)
+        variant:        'hydra', 'hydra_bottleneck', 'hydra_gated'
+        rank:           Bottleneck rank
+        dropout:        Dropout rate
+        gate_type:      'scalar', 'vector', 'adaptive'
+        gate_init:      Initial sigmoid bias (-5 ≈ 0.7%, -3 ≈ 5%, 0 = 50%)
     """
-    def __init__(self, d_model, variant='hydra', rank=32,
-                 dropout=0.0, residual_scale=0.1):
+    def __init__(self, d_model, variant='hydra_gated', rank=32,
+                 dropout=0.0, gate_type='adaptive', gate_init=-5.0):
         super().__init__()
         self.variant = variant
-
+        
+        # Choose attention architecture based on variant
         if variant == 'hydra':
-            # Full-dim Hydra — high param count, use only for small d_model
             self.attn = HydraAttention(d_model, dropout=dropout)
-
+            attn_dim = d_model
+            
         elif variant == 'hydra_bottleneck':
-            # Project D→rank, Hydra on rank, project back
             self.proj_down = nn.Linear(d_model, rank)
             self.attn = HydraAttention(rank, dropout=dropout)
             self.proj_up = nn.Linear(rank, d_model)
-
+            attn_dim = d_model
+            
         elif variant == 'hydra_gated':
-            # Bottleneck + sigmoid gating — RECOMMENDED default
-            # Gating filters noisy cross-variable signals;
-            # bottleneck keeps params low (~20K vs ~263K for full-dim)
             self.proj_down = nn.Linear(d_model, rank)
             self.attn = HydraAttention(rank, dropout=dropout)
-            self.gate = nn.Sequential(
+            self.content_gate = nn.Sequential(
                 nn.Linear(rank, rank),
                 nn.Sigmoid()
             )
             self.proj_up = nn.Linear(rank, d_model)
-
+            attn_dim = d_model
         else:
-            raise ValueError(f"Unknown Hydra variant: {variant}")
-
+            raise ValueError(f"Unknown variant: {variant}")
+        
+        # Pre-norm
         self.norm = nn.LayerNorm(d_model)
-        self.alpha = nn.Parameter(torch.tensor(residual_scale))
+        
+        # Adaptive residual gate (replaces scalar α)
+        self.gate = AdaptiveGate(d_model, gate_type=gate_type, init_bias=gate_init)
+    
+    def _mix(self, h_norm):
+        """Apply the mixing operation (without residual)."""
+        if self.variant == 'hydra':
+            return self.attn(h_norm)
+            
+        elif self.variant == 'hydra_bottleneck':
+            h_low = self.proj_down(h_norm)
+            h_mixed = self.attn(h_low)
+            return self.proj_up(h_mixed)
+            
+        elif self.variant == 'hydra_gated':
+            h_low = self.proj_down(h_norm)
+            h_attn = self.attn(h_low)
+            gate = self.content_gate(h_low)
+            h_gated = h_attn * gate
+            return self.proj_up(h_gated)
 
     def forward(self, x, B, C):
         """
         Args:
-            x: [B*C, P, D]  — merged batch-channel tensor from the CI pipeline
-            B: int           — original batch size
-            C: int           — number of channels/variables
+            x: [B*C, P, D] — merged batch-channel tensor
+            B: Batch size
+            C: Number of channels
         Returns:
-            [B*C, P, D]     — same shape, with cross-variable info mixed in
+            [B*C, P, D] — same shape, with adaptive cross-channel mixing
         """
-        P = x.shape[1]
-        D = x.shape[2]
-
-        # Un-merge channels: [B*C, P, D] → [B, C, P, D]
-        h = x.reshape(B, C, P, D)
-
-        # Treat each patch position independently: [B, C, P, D] → [B*P, C, D]
-        h = h.permute(0, 2, 1, 3).reshape(B * P, C, D)
-
-        # Pre-norm
+        BC, P, D = x.shape
+        
+        # Reshape: [B*C, P, D] → [B, C, P, D] → [B*P, C, D]
+        h = x.reshape(B, C, P, D).permute(0, 2, 1, 3).reshape(B * P, C, D)
+        
+        # Pre-norm + mix
         h_norm = self.norm(h)
-
-        # Apply variant
-        if self.variant == 'hydra':
-            mixed = self.attn(h_norm)
-
-        elif self.variant == 'hydra_bottleneck':
-            h_low = self.proj_down(h_norm)      # [B*P, C, rank]
-            h_mixed = self.attn(h_low)           # [B*P, C, rank]
-            mixed = self.proj_up(h_mixed)        # [B*P, C, D]
-
-        elif self.variant == 'hydra_gated':
-            h_low = self.proj_down(h_norm)       # [B*P, C, rank]
-            h_attn = self.attn(h_low)            # [B*P, C, rank]
-            gate = self.gate(h_low)              # [B*P, C, rank] ∈ (0,1)
-            mixed = self.proj_up(h_attn * gate)  # [B*P, C, D]
-
-        # Residual with learnable scale
-        out = h + self.alpha * mixed
-
-        # Re-merge: [B*P, C, D] → [B, P, C, D] → [B, C, P, D] → [B*C, P, D]
-        out = out.reshape(B, P, C, D).permute(0, 2, 1, 3).reshape(B * C, P, D)
-
+        mixed = self._mix(h_norm)
+        
+        # Adaptive gate: decides how much mixing to apply
+        gate_val = self.gate(h, mixed)  # scalar, [D], or [B*P, 1, D]
+        
+        # Gated residual
+        out = h + gate_val * mixed
+        
+        # Reshape back: [B*P, C, D] → [B, C, P, D] → [B*C, P, D]
+        out = out.reshape(B, P, C, D).permute(0, 2, 1, 3).reshape(BC, P, D)
         return out
+    
+    def get_gate_values(self):
+        """Return current gate values for monitoring."""
+        with torch.no_grad():
+            if self.gate.gate_type == 'scalar':
+                return torch.sigmoid(self.gate.bias).item()
+            elif self.gate.gate_type == 'vector':
+                return torch.sigmoid(self.gate.bias).mean().item()
+            else:
+                return "adaptive (input-dependent)"
