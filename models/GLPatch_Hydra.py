@@ -1,12 +1,12 @@
 """
-GLPatch_Hydra v3: Universal architecture with adaptive gating.
+GLPatch_Hydra v3.1: Universal architecture with channel-aware gating.
 
-Hydra is always on. The gate learns whether to use it.
-No more cv_mixing='none' vs 'hydra_gated' decision.
+Hydra is always on. The gate uses log(C) + data statistics to decide
+mixing strength. No dataset-dependent on/off switch needed.
 
 Args:
   --cv_rank:      Bottleneck rank (default 32)
-  --gate_type:    'scalar', 'vector', 'adaptive' (default 'adaptive')
+  --gate_type:    'scalar', 'channel', 'adaptive' (default 'adaptive')
   --gate_init:    Initial sigmoid bias (default -5.0)
 """
 
