@@ -70,8 +70,8 @@ parser.add_argument('--revin', type=int, default=1, help='RevIN; True 1 False 0'
 parser.add_argument('--cv_rank', type=int, default=32,
                     help='Hydra bottleneck rank')
 parser.add_argument('--gate_type', type=str, default='adaptive',
-                    choices=['scalar', 'vector', 'adaptive'],
-                    help='Adaptive gate type for Hydra mixing')
+    choices=['scalar', 'channel', 'adaptive'],
+    help='Gate type: scalar (learned bias), channel (log(C) only), adaptive (log(C) + data stats)')
 parser.add_argument('--gate_init', type=float, default=-5.0,
                     help='Initial gate bias (sigmoid(-5)=0.7%, -3=5%, 0=50%)')
 
