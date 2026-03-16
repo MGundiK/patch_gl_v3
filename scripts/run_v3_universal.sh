@@ -1,27 +1,21 @@
 #!/bin/bash
 # ============================================================================
-# GLPatch_Hydra v3 — UNIVERSAL CONFIG TEST
+# GLPatch_Hydra v3.1 — Channel-Aware Gating
 # ============================================================================
-# ONE config for ALL datasets. No dataset-dependent switches.
-# Hydra is always on. The adaptive gate decides mixing strength.
+# Tests two gate types:
+#   adaptive: log(C) + variance + mean_abs → gate
+#   channel:  log(C) only → gate (ablation: is C alone sufficient?)
 #
-# Config: cv_rank=32, gate_type=adaptive, gate_init=-5.0
-#
-# Hypothesis: gate learns to open on high-C (Electricity, Traffic, Solar)
-#             and stay closed on low-C (ETTh1, ETTm1, Exchange)
-#
-# Also tests gate_type=scalar and gate_type=vector for ablation.
+# Both use gate_init=-5.0 (cold start).
+# Universal config: cv_rank=32 for all datasets.
 # ============================================================================
 
 MODEL="GLPatch_Hydra"
-LOGDIR="./logs/hydra_v3"
+LOGDIR="./logs/hydra_v3.1"
 
 echo ""
-echo "========== [$(date '+%H:%M:%S')] GLPatch_Hydra v3 — Universal Config =========="
+echo "========== [$(date '+%H:%M:%S')] GLPatch_Hydra v3.1 — Channel-Aware Gating =========="
 echo ""
-
-# ── Dataset definitions ──────────────────────────────────────────
-# Format: "label:data_flag:data_path:enc_in:batch_size:lr:seq_len:label_len:pred_lens:extra_args"
 
 DATASETS=(
   "ETTh1:ETTh1:ETTh1.csv:7:2048:0.0005:96:48:96,192,336,720:"
@@ -36,25 +30,21 @@ DATASETS=(
   "ILI:custom:national_illness.csv:7:32:0.01:36:18:24,36,48,60:--patch_len 6 --stride 3 --lradj type3"
 )
 
-# ── Gate types to test ───────────────────────────────────────────
-# Start with adaptive only. Add scalar/vector for ablation later.
-GATE_TYPES=("adaptive")
+GATE_TYPES=("adaptive" "channel")
 
 for GATE in "${GATE_TYPES[@]}"; do
   echo ""
   echo "══════════════════════════════════════════════════════════════"
-  echo "  Gate type: ${GATE}"
+  echo "  Gate type: ${GATE} (with log(C) injection)"
   echo "══════════════════════════════════════════════════════════════"
 
   for DS_INFO in "${DATASETS[@]}"; do
     IFS=':' read -r DS DATA_FLAG DATA_PATH ENC_IN BS LR SL LL PRED_LENS EXTRA <<< "$DS_INFO"
-    
     IFS=',' read -ra PLS <<< "$PRED_LENS"
-    
-    echo ""
-    echo ">>> [$(date '+%H:%M:%S')] ${DS} (C=${ENC_IN})"
 
-    # Default args (no lradj override unless in EXTRA)
+    echo ""
+    echo ">>> [$(date '+%H:%M:%S')] ${DS} (C=${ENC_IN}, logC_norm=$(python3 -c "import math; print(f'{math.log(max(${ENC_IN},2))/math.log(1000):.3f}')"))"
+
     LRADJ_ARG=""
     if [[ "$EXTRA" != *"lradj"* ]]; then
       LRADJ_ARG="--lradj sigmoid"
@@ -67,22 +57,20 @@ for GATE in "${GATE_TYPES[@]}"; do
       --ma_type ema --alpha 0.3 --beta 0.3 \
       --batch_size ${BS} --learning_rate ${LR} ${LRADJ_ARG} \
       --train_epochs 100 --patience 10 --revin 1 --use_amp \
-      --cv_rank 32 --gate_type ${GATE} --gate_init -3.0 \
+      --cv_rank 32 --gate_type ${GATE} --gate_init -5.0 \
       ${EXTRA}"
 
     for PL in "${PLS[@]}"; do
       sdir="${LOGDIR}/${GATE}/${DS}"; mkdir -p ${sdir}
-      echo "  [$(date '+%H:%M:%S')] ${DS} pl=${PL}"
+      echo "  [$(date '+%H:%M:%S')] ${DS} pl=${PL} gate=${GATE}"
       python -u run.py --model $MODEL \
-        --model_id "v3_${DS}_${PL}_${GATE}" \
-        --pred_len $PL --des "v3_${GATE}" \
+        --model_id "v31_${DS}_${PL}_${GATE}" \
+        --pred_len $PL --des "v31_${GATE}" \
         $COMMON \
         2>&1 | tee ${sdir}/${PL}.log
     done
 
-    # Print results for this dataset
-    echo "  === ${DS} (C=${ENC_IN}) ==="
-    printf "  %-10s|" "${GATE}"
+    printf "  %-12s|" "${DS}"
     for PL in "${PLS[@]}"; do
       logfile="${LOGDIR}/${GATE}/${DS}/${PL}.log"
       if [ -f "$logfile" ]; then
@@ -102,21 +90,20 @@ done
 echo ""
 echo "========== [$(date '+%H:%M:%S')] FINAL SUMMARY =========="
 echo ""
-echo "Universal config: cv_rank=32, gate_init=-3.0"
-echo ""
 
 for GATE in "${GATE_TYPES[@]}"; do
-  echo "Gate type: ${GATE}"
+  echo "Gate: ${GATE}"
   echo "─────────────────────────────────────────────────────────────"
-  printf "  %-12s C    |" "Dataset"
+  printf "  %-12s %4s logC  |" "Dataset" "C"
   echo "     T1       T2       T3       T4"
-  echo "  ──────────────────+────────────────────────────────────────"
+  echo "  ────────────────────────+────────────────────────────────────────"
   
   for DS_INFO in "${DATASETS[@]}"; do
     IFS=':' read -r DS DATA_FLAG DATA_PATH ENC_IN BS LR SL LL PRED_LENS EXTRA <<< "$DS_INFO"
     IFS=',' read -ra PLS <<< "$PRED_LENS"
+    LOG_C=$(python3 -c "import math; print(f'{math.log(max(${ENC_IN},2))/math.log(1000):.2f}')")
     
-    printf "  %-12s %3d  |" "$DS" "$ENC_IN"
+    printf "  %-12s %4d %4s  |" "$DS" "$ENC_IN" "$LOG_C"
     for PL in "${PLS[@]}"; do
       logfile="${LOGDIR}/${GATE}/${DS}/${PL}.log"
       if [ -f "$logfile" ]; then
@@ -131,6 +118,12 @@ for GATE in "${GATE_TYPES[@]}"; do
   echo ""
 done
 
-echo ""
-echo "Compare with GLPatch baselines to see if gate auto-disables on low-C"
 echo "Log files: ${LOGDIR}/<gate_type>/<dataset>/<pred_len>.log"
+echo ""
+echo "Expected log(C) values:"
+echo "  ETT/ILI (C=7):    0.28"
+echo "  Exchange (C=8):    0.30"
+echo "  Weather (C=21):    0.44"
+echo "  Solar (C=137):     0.71"
+echo "  Electricity (C=321): 0.84"
+echo "  Traffic (C=862):   0.98"
