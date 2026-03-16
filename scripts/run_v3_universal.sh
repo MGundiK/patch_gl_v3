@@ -67,7 +67,7 @@ for GATE in "${GATE_TYPES[@]}"; do
       --ma_type ema --alpha 0.3 --beta 0.3 \
       --batch_size ${BS} --learning_rate ${LR} ${LRADJ_ARG} \
       --train_epochs 100 --patience 10 --revin 1 --use_amp \
-      --cv_rank 32 --gate_type ${GATE} --gate_init -5.0 \
+      --cv_rank 32 --gate_type ${GATE} --gate_init -3.0 \
       ${EXTRA}"
 
     for PL in "${PLS[@]}"; do
@@ -102,7 +102,7 @@ done
 echo ""
 echo "========== [$(date '+%H:%M:%S')] FINAL SUMMARY =========="
 echo ""
-echo "Universal config: cv_rank=32, gate_init=-5.0"
+echo "Universal config: cv_rank=32, gate_init=-3.0"
 echo ""
 
 for GATE in "${GATE_TYPES[@]}"; do
