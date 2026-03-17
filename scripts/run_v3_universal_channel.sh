@@ -30,7 +30,7 @@ DATASETS=(
   "ILI:custom:national_illness.csv:7:32:0.01:36:18:24,36,48,60:--patch_len 6 --stride 3 --lradj type3"
 )
 
-GATE_TYPES=("adaptive" "channel")
+GATE_TYPES=( "channel")
 
 for GATE in "${GATE_TYPES[@]}"; do
   echo ""
