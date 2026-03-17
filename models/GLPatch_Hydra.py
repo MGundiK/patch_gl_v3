@@ -1,12 +1,9 @@
 """
-GLPatch_Hydra v3.1: Universal architecture with channel-aware gating.
-
-Hydra is always on. The gate uses log(C) + data statistics to decide
-mixing strength. No dataset-dependent on/off switch needed.
+GLPatch_Hydra v3.2: Hybrid gate (channel-primary + learned data bonus).
 
 Args:
   --cv_rank:      Bottleneck rank (default 32)
-  --gate_type:    'scalar', 'channel', 'adaptive' (default 'adaptive')
+  --gate_type:    'hybrid', 'channel', 'adaptive', 'scalar' (default 'hybrid')
   --gate_init:    Initial sigmoid bias (default -5.0)
 """
 
@@ -41,7 +38,7 @@ class Model(nn.Module):
 
         # Hydra config (universal — no on/off switch)
         cv_rank = getattr(configs, 'cv_rank', 32)
-        gate_type = getattr(configs, 'gate_type', 'adaptive')
+        gate_type = getattr(configs, 'gate_type', 'hybrid')
         gate_init = getattr(configs, 'gate_init', -5.0)
 
         self.net = GLPatchHydraNetwork(
