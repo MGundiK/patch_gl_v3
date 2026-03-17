@@ -1,9 +1,5 @@
 """
-GLPatch v3.1 network — Hydra with Channel-Aware Adaptive Gating.
-
-Key change from v3: gate receives log(C) as explicit input.
-This gives the gate a structural prior about dataset size,
-not just data-dependent statistics (variance).
+GLPatch v3.2 network — Hydra with Hybrid Gate (channel-primary + data bonus).
 """
 
 import torch
@@ -129,7 +125,7 @@ class GLPatchHydraNetwork(nn.Module):
             gate_init=gate_init,
         )
 
-        print(f"[GLPatch_Hydra v3.1] ALWAYS-ON hydra_gated @ post_fusion, "
+        print(f"[GLPatch_Hydra v3.2] ALWAYS-ON hydra_gated @ post_fusion, "
               f"d_model={pred_len}, rank={effective_rank}, C={n_channels}, "
               f"gate={gate_type} (init={gate_init}), logC={__import__('math').log(max(n_channels,2))/__import__('math').log(1000):.3f}")
 
