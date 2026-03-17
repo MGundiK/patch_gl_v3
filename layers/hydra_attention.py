@@ -118,7 +118,7 @@ class AdaptiveGate(nn.Module):
             
         elif self.gate_type == 'channel':
             # log_c is constant per dataset — gate is same for all batches
-            log_c_input = self.log_c.unsqueeze(0)  # [1, 1]
+            log_c_input = self.log_c.view(1, 1)  # [1, 1] — must be 2D for Linear
             gate_logits = self.gate_net(log_c_input)  # [1, D]
             return torch.sigmoid(gate_logits).unsqueeze(1)  # [1, 1, D]
             
