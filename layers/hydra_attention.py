@@ -59,11 +59,10 @@ class AdaptiveGate(nn.Module):
         gate_type:   'hybrid', 'channel', 'adaptive', 'scalar'
         init_bias:   Initial bias for sigmoid
     """
-    def __init__(self, d_model, n_channels=1, gate_type='hybrid', init_bias=-5.0, gate_temp=1.0):
+    def __init__(self, d_model, n_channels=1, gate_type='hybrid', init_bias=-5.0):
         super().__init__()
         self.gate_type = gate_type
         self.d_model = d_model
-        self.gate_temp = gate_temp
         
         # Precompute normalized log(C)
         self.register_buffer(
@@ -129,12 +128,12 @@ class AdaptiveGate(nn.Module):
             gate: values in (0, 1), broadcastable to [B, C, D]
         """
         if self.gate_type == 'scalar':
-            return torch.sigmoid(self.gate_temp * self.bias)
+            return torch.sigmoid(self.bias)
             
         elif self.gate_type == 'channel':
             log_c_input = self.log_c.view(1, 1)         # [1, 1]
             logits = self.channel_net(log_c_input)        # [1, D]
-            return torch.sigmoid(self.gate_temp * logits).unsqueeze(1)     # [1, 1, D]
+            return torch.sigmoid(logits).unsqueeze(1)     # [1, 1, D]
             
         elif self.gate_type == 'hybrid':
             # Primary signal: f(logC)
@@ -149,7 +148,7 @@ class AdaptiveGate(nn.Module):
             # channel_logits broadcasts over batch dim
             logits = channel_logits + self.epsilon * data_correction  # [B, D]
             
-            return torch.sigmoid(self.gate_temp * logits).unsqueeze(1)      # [B, 1, D]
+            return torch.sigmoid(logits).unsqueeze(1)      # [B, 1, D]
             
         elif self.gate_type == 'adaptive':
             B, C, D = x_input.shape
@@ -158,28 +157,26 @@ class AdaptiveGate(nn.Module):
             log_c_expanded = self.log_c.expand(B, 1)
             gate_input = torch.cat([chan_var, chan_mean_abs, log_c_expanded], dim=1)
             gate_logits = self.gate_net(gate_input)
-            return torch.sigmoid(self.gate_temp * gate_logits).unsqueeze(1)
+            return torch.sigmoid(gate_logits).unsqueeze(1)
     
     def get_gate_info(self):
         """Return gate state for monitoring."""
         with torch.no_grad():
             log_c_val = self.log_c.item()
-            t = self.gate_temp
-            t_str = f", τ={t:.1f}" if t != 1.0 else ""
             if self.gate_type == 'scalar':
-                return f"scalar: {torch.sigmoid(t * self.bias).item():.4f}{t_str}"
+                return f"scalar: {torch.sigmoid(self.bias).item():.4f}"
             elif self.gate_type == 'channel':
                 log_c_input = self.log_c.view(1, 1)
-                vals = torch.sigmoid(t * self.channel_net(log_c_input))
-                return f"channel (logC={log_c_val:.3f}): mean_gate={vals.mean().item():.4f}{t_str}"
+                vals = torch.sigmoid(self.channel_net(log_c_input))
+                return f"channel (logC={log_c_val:.3f}): mean_gate={vals.mean().item():.4f}"
             elif self.gate_type == 'hybrid':
                 log_c_input = self.log_c.view(1, 1)
-                base = torch.sigmoid(t * self.channel_net(log_c_input))
+                base = torch.sigmoid(self.channel_net(log_c_input))
                 eps = self.epsilon.item()
                 return (f"hybrid (logC={log_c_val:.3f}): "
-                        f"base_gate={base.mean().item():.4f}, ε={eps:.4f}{t_str}")
+                        f"base_gate={base.mean().item():.4f}, ε={eps:.4f}")
             else:
-                return f"adaptive (logC={log_c_val:.3f}): input-dependent{t_str}"
+                return f"adaptive (logC={log_c_val:.3f}): input-dependent"
 
 
 class HydraChannelMixer(nn.Module):
@@ -188,7 +185,7 @@ class HydraChannelMixer(nn.Module):
     """
     def __init__(self, d_model, variant='hydra_gated', rank=32,
                  n_channels=7, dropout=0.0,
-                 gate_type='hybrid', gate_init=-5.0, gate_temp=1.0):
+                 gate_type='hybrid', gate_init=-5.0):
         super().__init__()
         self.variant = variant
         
@@ -213,8 +210,7 @@ class HydraChannelMixer(nn.Module):
         
         self.gate = AdaptiveGate(
             d_model, n_channels=n_channels,
-            gate_type=gate_type, init_bias=gate_init,
-            gate_temp=gate_temp
+            gate_type=gate_type, init_bias=gate_init
         )
     
     def _mix(self, h_norm):
@@ -248,8 +244,30 @@ class HydraChannelMixer(nn.Module):
         gate_val = self.gate(h, mixed)
         out = h + gate_val * mixed
         
+        # Store actual gate stats for logging (detached, no grad impact)
+        with torch.no_grad():
+            self._last_gate_mean = gate_val.mean().item()
+            self._last_gate_min = gate_val.min().item()
+            self._last_gate_max = gate_val.max().item()
+            self._last_mixed_norm = mixed.norm(dim=-1).mean().item()
+            self._last_input_norm = h.norm(dim=-1).mean().item()
+            self._last_contribution = (gate_val * mixed).norm(dim=-1).mean().item()
+        
         out = out.reshape(B, P, C, D).permute(0, 2, 1, 3).reshape(BC, P, D)
         return out
     
     def get_gate_info(self):
         return self.gate.get_gate_info()
+    
+    def get_gate_stats(self):
+        """Return actual runtime gate statistics from last forward pass."""
+        if not hasattr(self, '_last_gate_mean'):
+            return "no forward pass yet"
+        eps_str = ""
+        if hasattr(self.gate, 'epsilon'):
+            eps_str = f", ε={self.gate.epsilon.item():.6f}"
+        return (f"gate=[{self._last_gate_min:.6f}, {self._last_gate_mean:.6f}, {self._last_gate_max:.6f}]"
+                f"{eps_str}"
+                f", |mixed|={self._last_mixed_norm:.4f}"
+                f", |input|={self._last_input_norm:.4f}"
+                f", |gate*mixed|={self._last_contribution:.4f}")
