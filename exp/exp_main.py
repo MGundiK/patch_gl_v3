@@ -2,7 +2,6 @@ from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
 from models import xPatch
 from models import GLPatch
-from models import GLPatch_Hydra
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric
 
@@ -26,7 +25,6 @@ class Exp_Main(Exp_Basic):
         model_dict = {
             'xPatch': xPatch,
             'GLPatch': GLPatch,
-            'GLPatch_Hydra': GLPatch_Hydra
         }
         model = model_dict[self.args.model].Model(self.args).float()
 
@@ -155,6 +153,12 @@ class Exp_Main(Exp_Basic):
                         speed = (time.time() - time_now) / iter_count
                         left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
                         print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+                        # === GATE PROBE (remove after debugging) ===
+                        try:
+                            hydra = self.model.module.net.hydra if hasattr(self.model, 'module') else self.model.net.hydra
+                            print(f"\tGATE_STATS epoch={epoch+1} batch={i+1}: {hydra.get_gate_stats()}")
+                        except AttributeError:
+                            pass
                         iter_count = 0
                         time_now = time.time()
 
@@ -184,6 +188,12 @@ class Exp_Main(Exp_Basic):
                         speed = (time.time() - time_now) / iter_count
                         left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
                         print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+                        # === GATE PROBE (remove after debugging) ===
+                        try:
+                            hydra = self.model.module.net.hydra if hasattr(self.model, 'module') else self.model.net.hydra
+                            print(f"\tGATE_STATS epoch={epoch+1} batch={i+1}: {hydra.get_gate_stats()}")
+                        except AttributeError:
+                            pass
                         iter_count = 0
                         time_now = time.time()
 
@@ -192,6 +202,12 @@ class Exp_Main(Exp_Basic):
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
+            # === GATE PROBE per-epoch (remove after debugging) ===
+            try:
+                hydra = self.model.module.net.hydra if hasattr(self.model, 'module') else self.model.net.hydra
+                print(f"  GATE_STATS epoch={epoch+1} end: {hydra.get_gate_stats()}")
+            except AttributeError:
+                pass
             vali_loss = self.vali(vali_data, vali_loader, mae_criterion, is_test=False)
             test_loss = self.vali(test_data, test_loader, mse_criterion)
 
