@@ -60,20 +60,24 @@ for DS_INFO in "${DATASETS[@]}"; do
 
   for GINIT in "${GATE_INITS[@]}"; do
     if [ "$GINIT" == "none" ]; then
-      CV_ARGS="--cv_mixing none --cv_rank 32 --gate_type hybrid --gate_init -5.0"
+      # Base GLPatch model — no Hydra at all
+      RUN_MODEL="GLPatch"
+      CV_ARGS=""
       TAG="none"
     else
-      CV_ARGS="--cv_mixing hydra_gated --cv_rank 32 --gate_type hybrid --gate_init ${GINIT}"
+      # GLPatch_Hydra with hybrid gate at specified init
+      RUN_MODEL="GLPatch_Hydra"
+      CV_ARGS="--cv_rank 32 --gate_type hybrid --gate_init ${GINIT}"
       TAG="gi${GINIT}"
     fi
 
     echo ""
-    echo "  --- gate_init=${GINIT} ---"
+    echo "  --- model=${RUN_MODEL}, gate_init=${GINIT} ---"
 
     for PL in "${PLS[@]}"; do
       sdir="${LOGDIR}/${DS}/${TAG}"; mkdir -p ${sdir}
       echo "  [$(date '+%H:%M:%S')] ${DS} pl=${PL} gate_init=${GINIT}"
-      python -u run.py --model $MODEL \
+      python -u run.py --model $RUN_MODEL \
         --model_id "cold_${DS}_${PL}_${TAG}" \
         --pred_len $PL --des "cold_${TAG}" \
         ${CV_ARGS} \
