@@ -72,6 +72,8 @@ parser.add_argument('--cv_rank', type=int, default=32,
 parser.add_argument('--gate_type', type=str, default='hybrid',
     choices=['scalar', 'channel', 'adaptive', 'hybrid'],
     help='Gate type: hybrid (recommended), channel (logC only), adaptive (logC+stats), scalar')
+parser.add_argument('--gate_init', type=float, default=-5.0,
+                    help='Initial gate bias (sigmoid(-5)=0.7%, -3=5%, 0=50%)')
 parser.add_argument('--gate_temp', type=float, default=1.0,
                     help='Gate sigmoid temperature τ — higher = sharper (1.0=standard, 3.0/5.0=sharp)')
 
