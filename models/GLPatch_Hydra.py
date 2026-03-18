@@ -5,6 +5,7 @@ Args:
   --cv_rank:      Bottleneck rank (default 32)
   --gate_type:    'hybrid', 'channel', 'adaptive', 'scalar' (default 'hybrid')
   --gate_init:    Initial sigmoid bias (default -5.0)
+  --gate_temp:    Sigmoid temperature τ — higher = sharper gate (default 1.0)
 """
 
 import torch
@@ -40,12 +41,14 @@ class Model(nn.Module):
         cv_rank = getattr(configs, 'cv_rank', 32)
         gate_type = getattr(configs, 'gate_type', 'hybrid')
         gate_init = getattr(configs, 'gate_init', -5.0)
+        gate_temp = getattr(configs, 'gate_temp', 1.0)
 
         self.net = GLPatchHydraNetwork(
             seq_len, pred_len, patch_len, stride, padding_patch,
             cv_rank=cv_rank,
             gate_type=gate_type,
             gate_init=gate_init,
+            gate_temp=gate_temp,
             n_channels=c_in,
         )
 
