@@ -37,7 +37,7 @@ class GLPatchHydraNetwork(nn.Module):
     """
     def __init__(self, seq_len, pred_len, patch_len, stride, padding_patch,
                  cv_rank=32, gate_type='adaptive', gate_init=-5.0,
-                 n_channels=7):
+                 gate_temp=1.0, n_channels=7):
         super(GLPatchHydraNetwork, self).__init__()
 
         self.pred_len = pred_len
@@ -123,11 +123,13 @@ class GLPatchHydraNetwork(nn.Module):
             dropout=0.0,
             gate_type=gate_type,
             gate_init=gate_init,
+            gate_temp=gate_temp,
         )
 
+        temp_str = f", τ={gate_temp}" if gate_temp != 1.0 else ""
         print(f"[GLPatch_Hydra v3.2] ALWAYS-ON hydra_gated @ post_fusion, "
               f"d_model={pred_len}, rank={effective_rank}, C={n_channels}, "
-              f"gate={gate_type} (init={gate_init}), logC={__import__('math').log(max(n_channels,2))/__import__('math').log(1000):.3f}")
+              f"gate={gate_type} (init={gate_init}{temp_str}), logC={__import__('math').log(max(n_channels,2))/__import__('math').log(1000):.3f}")
 
     def forward(self, s, t):
         s = s.permute(0, 2, 1)
