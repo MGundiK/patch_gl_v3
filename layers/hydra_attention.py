@@ -1,21 +1,31 @@
 """
-Hydra Attention v3.2b — Sum pooling + mix_norm output cap.
+Hydra Attention v3.2c — Epsilon gradient flow fix.
 
-Changes from v3.2 (gate_probe version):
-  - HydraAttention.forward: reverted to .sum(dim=1) — preserves the high-C
-    gate dynamics that were working (gate_mean ~0.116 on Electricity,
-    slow and stable). Mean pooling opened the gate to ~0.922 on Electricity
-    and hurt MSE by +0.8%.
-  - HydraChannelMixer: added self.mix_norm = LayerNorm(d_model) applied to
-    the output of _mix() before the adaptive gate sees it. This hard-caps
-    |mixed| regardless of what proj weights learn, breaking the tug-of-war
-    between projection amplification and gate suppression on low-C datasets.
-    Placed AFTER proj_up so it operates in d_model space and is C-invariant.
+Changes from v3.2b:
+  - Reverted mix_norm (removed): LayerNorm on _mix() output caused γ to
+    re-amplify |mixed| internally, shifting the problem rather than fixing it.
+    Traffic regressed −1.4% and ETTm1 got slightly worse vs v3.2 baseline.
 
-Why this is more targeted than mean pooling:
-  - Sum pooling kept: high-C gate trajectory unchanged.
-  - mix_norm added: |mixed| norm is now bounded, so gate doesn't need to
-    work as hard to suppress low-information mixing on low-C.
+  - Fixed ε gradient flow (the real Option C fix):
+    In v3.2 and v3.2b, data_net final layer was zero-initialized on BOTH
+    weight and bias:
+        nn.init.zeros_(self.data_net[2].weight)
+        nn.init.zeros_(self.data_net[2].bias)
+    This means data_correction = 0 for ALL inputs at init, so
+    ε * data_correction = 0 regardless of ε's value → ε receives exactly
+    zero gradient throughout training. The hybrid gate has never actually
+    been hybrid across any experiment.
+
+    Fix: keep weight zero-init (preserves the "pure channel at start"
+    guarantee) but use DEFAULT initialization for the bias, so data_net
+    produces non-zero outputs from epoch 1 and ε has actual gradient signal
+    to learn from. ε is still initialized at 0, so early behavior remains
+    pure channel gate — but now it can grow if variance is informative.
+
+    Specifically, the bias of a Linear(d_model//4, d_model) layer defaults
+    to Kaiming uniform ~ U(-1/sqrt(d_model//4), 1/sqrt(d_model//4)).
+    For d_model=512, rank=32, that's ~ U(-0.177, 0.177) — small but nonzero,
+    enough to give ε a gradient from the first batch.
 
 Gate types:
   'hybrid':   log(C) primary + ε·variance correction (RECOMMENDED)
@@ -43,7 +53,7 @@ class HydraAttention(nn.Module):
         Q = F.normalize(self.W_q(x), p=2, dim=-1)
         K = F.normalize(self.W_k(x), p=2, dim=-1)
         V = self.W_v(x)
-        # Sum pooling retained: preserves high-C gate dynamics.
+        # Sum pooling: preserves high-C gate dynamics.
         global_feat = (K * V).sum(dim=1, keepdim=True)
         return self.dropout(Q * global_feat)
 
@@ -58,11 +68,9 @@ class AdaptiveGate(nn.Module):
     g(variance):  MLP that maps channel variance → per-feature correction
     ε:            Learnable scalar, init=0 (pure channel at start)
 
-    Args:
-        d_model:     Feature dimension
-        n_channels:  Number of variables (C)
-        gate_type:   'hybrid', 'channel', 'adaptive', 'scalar'
-        init_bias:   Initial bias for sigmoid
+    Key fix in v3.2c:
+    data_net final bias uses DEFAULT init (not zero) so data_correction != 0
+    from epoch 1, giving ε real gradient signal to learn from.
     """
     def __init__(self, d_model, n_channels=1, gate_type='hybrid', init_bias=-5.0, gate_temp=1.0):
         super().__init__()
@@ -70,7 +78,6 @@ class AdaptiveGate(nn.Module):
         self.d_model = d_model
         self.gate_temp = gate_temp
 
-        # Precompute normalized log(C)
         self.register_buffer(
             'log_c', torch.tensor(math.log(max(n_channels, 2)) / math.log(1000))
         )
@@ -97,16 +104,20 @@ class AdaptiveGate(nn.Module):
             nn.init.zeros_(self.channel_net[2].weight)
             nn.init.constant_(self.channel_net[2].bias, init_bias)
 
-            # Data bonus: g(variance) → per-feature correction
+            # Data bonus: g(variance) → per-feature correction.
+            # Weight zero-init: preserves "pure channel at start" guarantee.
+            # Bias DEFAULT init: data_net produces nonzero outputs from epoch 1
+            # so ε receives actual gradient signal and can learn.
             self.data_net = nn.Sequential(
                 nn.Linear(d_model, d_model // 4),
                 nn.GELU(),
                 nn.Linear(d_model // 4, d_model),
             )
             nn.init.zeros_(self.data_net[2].weight)
-            nn.init.zeros_(self.data_net[2].bias)
+            # data_net[2].bias intentionally left at default Kaiming uniform init
 
-            # ε: learnable mixing weight, init=0 → pure channel at start
+            # ε: learnable scalar, init=0 → pure channel at start.
+            # Now actually receives gradients since data_correction != 0.
             self.epsilon = nn.Parameter(torch.tensor(0.0))
 
         elif gate_type == 'adaptive':
@@ -126,7 +137,7 @@ class AdaptiveGate(nn.Module):
         """
         Args:
             x_input: [B, C, D] original input
-            mixed:   [B, C, D] Hydra output (already mix_norm'd)
+            mixed:   [B, C, D] Hydra output
         Returns:
             gate: values in (0, 1), broadcastable to [B, C, D]
         """
@@ -158,7 +169,6 @@ class AdaptiveGate(nn.Module):
             return torch.sigmoid(self.gate_temp * gate_logits).unsqueeze(1)
 
     def get_gate_info(self):
-        """Return gate state for monitoring."""
         with torch.no_grad():
             log_c_val = self.log_c.item()
             t = self.gate_temp
@@ -174,7 +184,7 @@ class AdaptiveGate(nn.Module):
                 base = torch.sigmoid(t * self.channel_net(log_c_input))
                 eps = self.epsilon.item()
                 return (f"hybrid (logC={log_c_val:.3f}): "
-                        f"base_gate={base.mean().item():.4f}, ε={eps:.4f}{t_str}")
+                        f"base_gate={base.mean().item():.4f}, ε={eps:.6f}{t_str}")
             else:
                 return f"adaptive (logC={log_c_val:.3f}): input-dependent{t_str}"
 
@@ -206,13 +216,7 @@ class HydraChannelMixer(nn.Module):
         else:
             raise ValueError(f"Unknown variant: {variant}")
 
-        # Input norm (unchanged from v3.2)
         self.norm = nn.LayerNorm(d_model)
-
-        # Output norm: caps |mixed| after proj_up, before adaptive gate.
-        # Operates in d_model space so it's C-invariant.
-        # Breaks the proj amplification vs gate suppression tug-of-war on low-C.
-        self.mix_norm = nn.LayerNorm(d_model)
 
         self.gate = AdaptiveGate(
             d_model, n_channels=n_channels,
@@ -247,11 +251,10 @@ class HydraChannelMixer(nn.Module):
         h = x.reshape(B, C, P, D).permute(0, 2, 1, 3).reshape(B * P, C, D)
 
         h_norm = self.norm(h)
-        mixed = self.mix_norm(self._mix(h_norm))   # norm caps |mixed| here
+        mixed = self._mix(h_norm)
         gate_val = self.gate(h, mixed)
         out = h + gate_val * mixed
 
-        # Store gate stats for logging (detached, no grad impact)
         with torch.no_grad():
             self._last_gate_mean = gate_val.mean().item()
             self._last_gate_min = gate_val.min().item()
@@ -267,7 +270,6 @@ class HydraChannelMixer(nn.Module):
         return self.gate.get_gate_info()
 
     def get_gate_stats(self):
-        """Return actual runtime gate statistics from last forward pass."""
         if not hasattr(self, '_last_gate_mean'):
             return "no forward pass yet"
         eps_str = ""
