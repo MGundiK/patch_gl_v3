@@ -1,46 +1,40 @@
 """
-Hydra Attention v3.2e — Mean pairwise correlation proxy as gate signal.
+Hydra Attention v3.2f — Centered correlation proxy: subtract 1/C baseline.
 
-Changes from v3.2d:
-  - data_net input changed from chan_var [B, d_model] to corr_proxy [B, 1].
-  - data_net first layer: Linear(1, d_model//4) instead of Linear(d_model, d_model//4).
+Changes from v3.2e:
+  - _corr_proxy now returns (mean_pairwise_cosine - 1/C) instead of raw mean.
 
-  Problem with chan_var (v3.2c/d):
-    Channel variance is ambiguous as a gating signal. High variance can mean:
-      (a) independent channels (Exchange — correctly suppress mixing)
-      (b) correlated-but-heteroscedastic channels (Solar — incorrectly suppressed)
-    This caused Solar regression in v3.2c and partial recovery in v3.2d.
+  Why this is more principled than √C scaling:
+    The raw proxy = (1/C²) Σ_i Σ_j cos(x_i, x_j) computes mean pairwise
+    cosine similarity via the centroid trick. For independent channels:
+      E[proxy] = 1/C  (each channel contributes 1/C to its own term)
+    For perfectly correlated channels:
+      proxy → 1
 
-  New signal — mean pairwise correlation proxy:
-    Measures "how much do channels point in the same direction" using O(B*C*D)
-    computation — no expensive C×C matrix (which would be O(B*C²*D), ~292B
-    flops/batch for Traffic C=862).
+    So the raw proxy has a C-dependent baseline that shifts with dataset.
+    Subtracting 1/C centers it at 0 for independent channels regardless
+    of C, and at (1 - 1/C) ≈ 1 for perfectly correlated channels.
 
-    Algorithm:
-      1. Center each channel's D-dim vector: x_centered = x - mean(x, dim=D)
-      2. L2-normalize per channel: x_norm = x_centered / ||x_centered||
-      3. Centroid direction: mean_channel = mean(x_norm, dim=C)  [B, D]
-      4. Each channel's cosine similarity to centroid: dot product [B, C]
-      5. corr_proxy = mean over C → [B, 1] scalar
+    Compared to √C scaling: that changes the signal non-linearly and doesn't
+    remove the C-dependence (it maps independent→1/√C, correlated→√C).
+    Centering by 1/C maps independent→0, correlated→~1, for all C. Cleaner.
 
-    Semantics:
-      - Perfectly correlated channels → all align with centroid → proxy → 1
-      - Independent channels → random directions cancel → proxy → ~0
-      - Heteroscedastic-but-correlated (Solar) → still aligns with centroid → proxy > 0
-      - Genuinely independent (Exchange) → centroid near zero → proxy ~0
+  Example values after centering:
+    Solar C=137: raw 0.85-0.95, baseline 0.007 → centered 0.84-0.94
+    ETTh1 C=7:   raw 0.32-0.37, baseline 0.143 → centered 0.18-0.23
+    Exchange C=8: raw 0.31-0.51, baseline 0.125 → centered 0.18-0.39
+    Traffic C=862: independent baseline 0.001 → centered near raw value
 
-    This correctly distinguishes Solar (correlated, should mix) from Exchange
-    (independent, should not mix), whereas chan_var could not.
+  Note: _n_channels stored as buffer for use in _corr_proxy.
 
-  Computational cost per batch:
-    O(B*P * C * D) — e.g. Traffic: 768 * 862 * 512 ≈ 339M float ops (fast).
-    Full C×C correlation would be 768 * 862² * 512 ≈ 292B ops (prohibitive).
-
-  data_net is now smaller (input dim 1 vs d_model), reducing parameter count
-  slightly.
+  Note on future directions:
+    A low-rank Mahalanobis in the rank=32 projection space (after proj_down)
+    would give a proper data-adaptive distance metric at manageable cost
+    O(B*P*C*32²) + O(32³), vs full D×D Mahalanobis at O(B*C*D²) + O(D³).
+    Viable future direction if centroid-cosine approaches plateau.
 
 Gate types:
-  'hybrid':   log(C) primary + ε·corr_proxy correction (RECOMMENDED)
+  'hybrid':   log(C) primary + ε·centered_corr_proxy correction (RECOMMENDED)
   'channel':  log(C) only (ablation baseline)
   'adaptive': log(C) + variance + mean_abs fully mixed (v3.1 design)
   'scalar':   Single learned bias (simplest baseline)
@@ -73,15 +67,13 @@ class AdaptiveGate(nn.Module):
     """
     Hybrid gate: channel-primary with learned correlation-based bonus.
 
-    gate = sigmoid( f(logC) + ε_eff · g(corr_proxy) )
+    gate = sigmoid( f(logC) + ε_eff · g(centered_corr_proxy) )
 
-    f(logC):      MLP: normalized log(C) → per-feature logits
-    g(corr_proxy): MLP: mean-pairwise-correlation scalar → per-feature correction
-    ε_raw:        Unconstrained learnable scalar, init=0
-    ε_eff:        softplus(ε_raw) — always >= 0, variance only opens gate
+    centered_corr_proxy = mean_pairwise_cosine(channels) - 1/C
+      ≈ 0    for independent channels (any C)
+      ≈ 1    for perfectly correlated channels (any C)
 
-    corr_proxy is the mean cosine similarity between each channel and the
-    channel centroid, computed in O(B*C*D). See module docstring for details.
+    ε_eff = softplus(ε_raw) >= 0: correlation only opens gate, never closes.
     """
     def __init__(self, d_model, n_channels=1, gate_type='hybrid', init_bias=-5.0, gate_temp=1.0):
         super().__init__()
@@ -91,6 +83,10 @@ class AdaptiveGate(nn.Module):
 
         self.register_buffer(
             'log_c', torch.tensor(math.log(max(n_channels, 2)) / math.log(1000))
+        )
+        # Store 1/C for centering the proxy
+        self.register_buffer(
+            '_baseline', torch.tensor(1.0 / max(n_channels, 1))
         )
 
         if gate_type == 'scalar':
@@ -115,10 +111,8 @@ class AdaptiveGate(nn.Module):
             nn.init.zeros_(self.channel_net[2].weight)
             nn.init.constant_(self.channel_net[2].bias, init_bias)
 
-            # Data bonus: g(corr_proxy) → per-feature correction.
-            # Input dim is 1 (scalar correlation proxy), not d_model.
-            # Weight zero-init: "pure channel at start" guarantee.
-            # Bias default init: gives ε real gradient from epoch 1.
+            # Data bonus: g(centered_corr_proxy) → per-feature correction.
+            # Input dim 1 (scalar). Weight zero-init, bias default.
             self.data_net = nn.Sequential(
                 nn.Linear(1, d_model // 4),
                 nn.GELU(),
@@ -127,7 +121,7 @@ class AdaptiveGate(nn.Module):
             nn.init.zeros_(self.data_net[2].weight)
             # data_net[2].bias left at default Kaiming uniform init
 
-            # ε_eff = softplus(ε_raw) >= 0: correlation only opens gate.
+            # ε_eff = softplus(ε_raw) >= 0
             self._epsilon_raw = nn.Parameter(torch.tensor(0.0))
 
         elif gate_type == 'adaptive':
@@ -146,37 +140,31 @@ class AdaptiveGate(nn.Module):
     def _epsilon_eff(self):
         return F.softplus(self._epsilon_raw)
 
-    @staticmethod
-    def _corr_proxy(x):
+    def _corr_proxy(self, x):
         """
-        Mean pairwise correlation proxy via centroid cosine similarity.
+        Centered mean pairwise cosine similarity.
+
+        proxy = mean_pairwise_cosine(x) - 1/C
+
+        For independent channels: E[proxy] ≈ 0  (for all C)
+        For perfectly correlated: proxy ≈ 1 - 1/C ≈ 1
 
         Args:
             x: [B, C, D]
         Returns:
-            corr_proxy: [B, 1] scalar in approximately [0, 1]
+            proxy: [B, 1], approximately in [-1/C, 1-1/C]
 
-        O(B * C * D) — safe for large C (Traffic C=862, Electricity C=321).
+        O(B * C * D) via centroid trick.
         """
-        # Center each channel's D-dim representation
-        x_centered = x - x.mean(dim=-1, keepdim=True)          # [B, C, D]
-        # L2-normalize per channel (handle near-zero channels safely)
-        x_norm = F.normalize(x_centered, dim=-1, eps=1e-6)      # [B, C, D]
-        # Centroid direction in unit-sphere space
-        mean_channel = x_norm.mean(dim=1)                        # [B, D]
-        # Each channel's cosine similarity to the centroid
+        x_centered = x - x.mean(dim=-1, keepdim=True)              # [B, C, D]
+        x_norm = F.normalize(x_centered, dim=-1, eps=1e-6)          # [B, C, D]
+        mean_channel = x_norm.mean(dim=1)                            # [B, D]
         cosine_to_mean = (x_norm * mean_channel.unsqueeze(1)).sum(dim=-1)  # [B, C]
-        # Mean over channels → scalar proxy
-        return cosine_to_mean.mean(dim=1, keepdim=True)          # [B, 1]
+        raw_proxy = cosine_to_mean.mean(dim=1, keepdim=True)         # [B, 1]
+        # Subtract 1/C baseline: centers at 0 for independent channels
+        return raw_proxy - self._baseline
 
     def forward(self, x_input, mixed):
-        """
-        Args:
-            x_input: [B, C, D] original input
-            mixed:   [B, C, D] Hydra output
-        Returns:
-            gate: values in (0, 1), broadcastable to [B, C, D]
-        """
         if self.gate_type == 'scalar':
             return torch.sigmoid(self.gate_temp * self.bias)
 
@@ -186,15 +174,12 @@ class AdaptiveGate(nn.Module):
             return torch.sigmoid(self.gate_temp * logits).unsqueeze(1)
 
         elif self.gate_type == 'hybrid':
-            # Primary: channel-count signal
             log_c_input = self.log_c.view(1, 1)
-            channel_logits = self.channel_net(log_c_input)          # [1, D]
+            channel_logits = self.channel_net(log_c_input)              # [1, D]
 
-            # Data bonus: mean pairwise correlation proxy
-            corr = self._corr_proxy(x_input)                        # [B, 1]
-            data_correction = self.data_net(corr)                    # [B, D]
+            corr = self._corr_proxy(x_input)                            # [B, 1]
+            data_correction = self.data_net(corr)                       # [B, D]
 
-            # ε_eff >= 0: correlation only opens the gate, never closes it
             logits = channel_logits + self._epsilon_eff() * data_correction
             return torch.sigmoid(self.gate_temp * logits).unsqueeze(1)
 
@@ -279,14 +264,6 @@ class HydraChannelMixer(nn.Module):
             return self.proj_up(h_attn * gate)
 
     def forward(self, x, B, C):
-        """
-        Args:
-            x: [B*C, P, D]
-            B: Batch size
-            C: Number of channels
-        Returns:
-            [B*C, P, D]
-        """
         BC, P, D = x.shape
 
         h = x.reshape(B, C, P, D).permute(0, 2, 1, 3).reshape(B * P, C, D)
@@ -303,10 +280,8 @@ class HydraChannelMixer(nn.Module):
             self._last_mixed_norm = mixed.norm(dim=-1).mean().item()
             self._last_input_norm = h.norm(dim=-1).mean().item()
             self._last_contribution = (gate_val * mixed).norm(dim=-1).mean().item()
-            # Log corr_proxy mean for monitoring
             if self.gate.gate_type == 'hybrid':
-                with torch.no_grad():
-                    self._last_corr_proxy = self.gate._corr_proxy(h).mean().item()
+                self._last_corr_proxy = self.gate._corr_proxy(h).mean().item()
 
         out = out.reshape(B, P, C, D).permute(0, 2, 1, 3).reshape(BC, P, D)
         return out
