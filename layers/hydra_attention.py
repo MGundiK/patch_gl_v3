@@ -18,6 +18,14 @@ Gate types:
   'channel':  log(C) only (ablation baseline)
   'adaptive': log(C) + variance + mean_abs fully mixed (v3.1 design)
   'scalar':   Single learned bias (simplest baseline)
+
+v3.2 mean-pool patch (2026-03-19):
+  global_feat now uses .mean(dim=1) instead of .sum(dim=1).
+  Rationale: sum scales with C — at C=7 each channel contributes 1/7 of
+  total energy vs 1/321 at C=321, causing ~46x energy difference that
+  proj weights overcompensate for on low-C datasets, producing large-norm
+  but low-information mixed vectors. Mean pooling is C-invariant so proj
+  weights learn a single consistent scale across all datasets.
 """
 
 import torch
@@ -39,7 +47,9 @@ class HydraAttention(nn.Module):
         Q = F.normalize(self.W_q(x), p=2, dim=-1)
         K = F.normalize(self.W_k(x), p=2, dim=-1)
         V = self.W_v(x)
-        global_feat = (K * V).sum(dim=1, keepdim=True)
+        # Mean pool instead of sum: makes global_feat C-invariant.
+        # Previously: (K * V).sum(dim=1, keepdim=True)
+        global_feat = (K * V).mean(dim=1, keepdim=True)
         return self.dropout(Q * global_feat)
 
 
