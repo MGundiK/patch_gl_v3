@@ -1,40 +1,45 @@
 """
-Hydra Attention v3.2f — Centered correlation proxy: subtract 1/C baseline.
+Hydra Attention v3.2g — Mean pooling in HydraAttention (normalize by C).
 
-Changes from v3.2e:
-  - _corr_proxy now returns (mean_pairwise_cosine - 1/C) instead of raw mean.
+Changes from v3.2d:
+  - Single line change in HydraAttention.forward():
+      sum(dim=1)  →  sum(dim=1) / C   (i.e., mean pooling)
 
-  Why this is more principled than √C scaling:
-    The raw proxy = (1/C²) Σ_i Σ_j cos(x_i, x_j) computes mean pairwise
-    cosine similarity via the centroid trick. For independent channels:
-      E[proxy] = 1/C  (each channel contributes 1/C to its own term)
-    For perfectly correlated channels:
-      proxy → 1
+  Why this is safe now when v3.2 mean_pool failed:
+    v3.2 mean_pool regressed Traffic badly because the gate opened to 0.922
+    (too fast, too wide). That experiment had ε=0 throughout — the ε gradient
+    was killed by the zero-bias init bug, so the gate had no data signal at all
+    and the channel_net's logC signal alone couldn't compensate.
 
-    So the raw proxy has a C-dependent baseline that shifts with dataset.
-    Subtracting 1/C centers it at 0 for independent channels regardless
-    of C, and at (1 - 1/C) ≈ 1 for perfectly correlated channels.
+    v3.2d has all the machinery that was missing then:
+      - ε gradient flow fixed (Kaiming uniform bias init on data_net final layer)
+      - softplus constraint: ε_eff = softplus(ε_raw) >= 0
+      - gate_init=-5.0: channel_net starts near-closed for all C
+      - variance-based data_net provides per-batch correction signal
 
-    Compared to √C scaling: that changes the signal non-linearly and doesn't
-    remove the C-dependence (it maps independent→1/√C, correlated→√C).
-    Centering by 1/C maps independent→0, correlated→~1, for all C. Cleaner.
+    The norm explosion diagnosis:
+      global_feat = (K*V).sum(dim=1) accumulates C terms.
+      At C=862 (Traffic), |mixed| reaches 150-235 vs |input|~5.
+      At C=7 (ETTm1), |mixed| is 1-60 — manageable.
+      Dividing by C makes the expected magnitude O(1) regardless of dataset,
+      removing the structural instability that v3.2d's gate fights against.
 
-  Example values after centering:
-    Solar C=137: raw 0.85-0.95, baseline 0.007 → centered 0.84-0.94
-    ETTh1 C=7:   raw 0.32-0.37, baseline 0.143 → centered 0.18-0.23
-    Exchange C=8: raw 0.31-0.51, baseline 0.125 → centered 0.18-0.39
-    Traffic C=862: independent baseline 0.001 → centered near raw value
+  Expected changes in probe stats:
+    Traffic C=862:  |mixed| drops from ~150-230 to ~0.17-0.27
+    Electricity C=321: |mixed| drops from ~10-57 to ~0.03-0.18
+    Solar C=137:    |mixed| drops from ~115-200 to ~0.84-1.46
+    ETTm1 C=7:     |mixed| drops from ~1-90 to ~0.14-13
+    ETTh1 C=7:     similar to ETTm1
+    Exchange C=8:  |mixed| already small (~1-8), drops to ~0.12-1
 
-  Note: _n_channels stored as buffer for use in _corr_proxy.
-
-  Note on future directions:
-    A low-rank Mahalanobis in the rank=32 projection space (after proj_down)
-    would give a proper data-adaptive distance metric at manageable cost
-    O(B*P*C*32²) + O(32³), vs full D×D Mahalanobis at O(B*C*D²) + O(D³).
-    Viable future direction if centroid-cosine approaches plateau.
+    The gate*mixed contribution will drop proportionally, but the gate itself
+    should open further since the gating mechanism now needs less suppression
+    to keep contributions bounded. The net effect on the residual stream
+    depends on whether the gate opens enough to compensate — which is exactly
+    what the probe will tell us.
 
 Gate types:
-  'hybrid':   log(C) primary + ε·centered_corr_proxy correction (RECOMMENDED)
+  'hybrid':   log(C) primary + ε·variance correction (RECOMMENDED)
   'channel':  log(C) only (ablation baseline)
   'adaptive': log(C) + variance + mean_abs fully mixed (v3.1 design)
   'scalar':   Single learned bias (simplest baseline)
@@ -47,7 +52,12 @@ import math
 
 
 class HydraAttention(nn.Module):
-    """Core Hydra: O(Nd) linear attention via cosine similarity."""
+    """Core Hydra: O(Nd) linear attention via cosine similarity.
+
+    v3.2g: mean pooling — global_feat divided by C so magnitude is O(1)
+    regardless of channel count. Eliminates the structural norm explosion
+    that scaled linearly with C under sum pooling.
+    """
     def __init__(self, d_model, dropout=0.0):
         super().__init__()
         self.W_q = nn.Linear(d_model, d_model, bias=False)
@@ -59,21 +69,21 @@ class HydraAttention(nn.Module):
         Q = F.normalize(self.W_q(x), p=2, dim=-1)
         K = F.normalize(self.W_k(x), p=2, dim=-1)
         V = self.W_v(x)
-        global_feat = (K * V).sum(dim=1, keepdim=True)
+        # Mean pooling: divide by C to make magnitude O(1) across all datasets.
+        # Key difference from v3.2d sum pooling.
+        C = x.shape[1]
+        global_feat = (K * V).sum(dim=1, keepdim=True) / C
         return self.dropout(Q * global_feat)
 
 
 class AdaptiveGate(nn.Module):
     """
-    Hybrid gate: channel-primary with learned correlation-based bonus.
+    Hybrid gate: channel-primary with learned data bonus.
+    Identical to v3.2d.
 
-    gate = sigmoid( f(logC) + ε_eff · g(centered_corr_proxy) )
+    gate = sigmoid( f(logC) + ε_eff · g(variance) )
 
-    centered_corr_proxy = mean_pairwise_cosine(channels) - 1/C
-      ≈ 0    for independent channels (any C)
-      ≈ 1    for perfectly correlated channels (any C)
-
-    ε_eff = softplus(ε_raw) >= 0: correlation only opens gate, never closes.
+    where ε_eff = softplus(ε_raw) >= 0 always.
     """
     def __init__(self, d_model, n_channels=1, gate_type='hybrid', init_bias=-5.0, gate_temp=1.0):
         super().__init__()
@@ -83,10 +93,6 @@ class AdaptiveGate(nn.Module):
 
         self.register_buffer(
             'log_c', torch.tensor(math.log(max(n_channels, 2)) / math.log(1000))
-        )
-        # Store 1/C for centering the proxy
-        self.register_buffer(
-            '_baseline', torch.tensor(1.0 / max(n_channels, 1))
         )
 
         if gate_type == 'scalar':
@@ -102,7 +108,6 @@ class AdaptiveGate(nn.Module):
             nn.init.constant_(self.channel_net[2].bias, init_bias)
 
         elif gate_type == 'hybrid':
-            # Primary: f(logC) → per-feature logits
             self.channel_net = nn.Sequential(
                 nn.Linear(1, d_model // 4),
                 nn.GELU(),
@@ -111,17 +116,14 @@ class AdaptiveGate(nn.Module):
             nn.init.zeros_(self.channel_net[2].weight)
             nn.init.constant_(self.channel_net[2].bias, init_bias)
 
-            # Data bonus: g(centered_corr_proxy) → per-feature correction.
-            # Input dim 1 (scalar). Weight zero-init, bias default.
             self.data_net = nn.Sequential(
-                nn.Linear(1, d_model // 4),
+                nn.Linear(d_model, d_model // 4),
                 nn.GELU(),
                 nn.Linear(d_model // 4, d_model),
             )
             nn.init.zeros_(self.data_net[2].weight)
             # data_net[2].bias left at default Kaiming uniform init
 
-            # ε_eff = softplus(ε_raw) >= 0
             self._epsilon_raw = nn.Parameter(torch.tensor(0.0))
 
         elif gate_type == 'adaptive':
@@ -140,30 +142,6 @@ class AdaptiveGate(nn.Module):
     def _epsilon_eff(self):
         return F.softplus(self._epsilon_raw)
 
-    def _corr_proxy(self, x):
-        """
-        Centered mean pairwise cosine similarity.
-
-        proxy = mean_pairwise_cosine(x) - 1/C
-
-        For independent channels: E[proxy] ≈ 0  (for all C)
-        For perfectly correlated: proxy ≈ 1 - 1/C ≈ 1
-
-        Args:
-            x: [B, C, D]
-        Returns:
-            proxy: [B, 1], approximately in [-1/C, 1-1/C]
-
-        O(B * C * D) via centroid trick.
-        """
-        x_centered = x - x.mean(dim=-1, keepdim=True)              # [B, C, D]
-        x_norm = F.normalize(x_centered, dim=-1, eps=1e-6)          # [B, C, D]
-        mean_channel = x_norm.mean(dim=1)                            # [B, D]
-        cosine_to_mean = (x_norm * mean_channel.unsqueeze(1)).sum(dim=-1)  # [B, C]
-        raw_proxy = cosine_to_mean.mean(dim=1, keepdim=True)         # [B, 1]
-        # Subtract 1/C baseline: centers at 0 for independent channels
-        return raw_proxy - self._baseline
-
     def forward(self, x_input, mixed):
         if self.gate_type == 'scalar':
             return torch.sigmoid(self.gate_temp * self.bias)
@@ -175,10 +153,10 @@ class AdaptiveGate(nn.Module):
 
         elif self.gate_type == 'hybrid':
             log_c_input = self.log_c.view(1, 1)
-            channel_logits = self.channel_net(log_c_input)              # [1, D]
+            channel_logits = self.channel_net(log_c_input)     # [1, D]
 
-            corr = self._corr_proxy(x_input)                            # [B, 1]
-            data_correction = self.data_net(corr)                       # [B, D]
+            chan_var = x_input.var(dim=1)                       # [B, D]
+            data_correction = self.data_net(chan_var)           # [B, D]
 
             logits = channel_logits + self._epsilon_eff() * data_correction
             return torch.sigmoid(self.gate_temp * logits).unsqueeze(1)
@@ -218,6 +196,7 @@ class AdaptiveGate(nn.Module):
 class HydraChannelMixer(nn.Module):
     """
     Cross-variable mixing via Hydra with hybrid gating.
+    Identical to v3.2d except HydraAttention now uses mean pooling.
     """
     def __init__(self, d_model, variant='hydra_gated', rank=32,
                  n_channels=7, dropout=0.0,
@@ -280,8 +259,6 @@ class HydraChannelMixer(nn.Module):
             self._last_mixed_norm = mixed.norm(dim=-1).mean().item()
             self._last_input_norm = h.norm(dim=-1).mean().item()
             self._last_contribution = (gate_val * mixed).norm(dim=-1).mean().item()
-            if self.gate.gate_type == 'hybrid':
-                self._last_corr_proxy = self.gate._corr_proxy(h).mean().item()
 
         out = out.reshape(B, P, C, D).permute(0, 2, 1, 3).reshape(BC, P, D)
         return out
@@ -293,16 +270,12 @@ class HydraChannelMixer(nn.Module):
         if not hasattr(self, '_last_gate_mean'):
             return "no forward pass yet"
         eps_str = ""
-        corr_str = ""
         if hasattr(self.gate, '_epsilon_raw'):
             eps_eff = self.gate._epsilon_eff().item()
             eps_raw = self.gate._epsilon_raw.item()
             eps_str = f", ε_raw={eps_raw:.6f}, ε_eff={eps_eff:.6f}"
-        if hasattr(self, '_last_corr_proxy'):
-            corr_str = f", corr_proxy={self._last_corr_proxy:.4f}"
         return (f"gate=[{self._last_gate_min:.6f}, {self._last_gate_mean:.6f}, {self._last_gate_max:.6f}]"
                 f"{eps_str}"
-                f"{corr_str}"
                 f", |mixed|={self._last_mixed_norm:.4f}"
                 f", |input|={self._last_input_norm:.4f}"
                 f", |gate*mixed|={self._last_contribution:.4f}")
