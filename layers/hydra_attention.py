@@ -1,31 +1,30 @@
 """
-Hydra Attention v3.2c — Epsilon gradient flow fix.
+Hydra Attention v3.2d — Epsilon constrained non-negative via softplus.
 
-Changes from v3.2b:
-  - Reverted mix_norm (removed): LayerNorm on _mix() output caused γ to
-    re-amplify |mixed| internally, shifting the problem rather than fixing it.
-    Traffic regressed −1.4% and ETTm1 got slightly worse vs v3.2 baseline.
+Changes from v3.2c:
+  - ε is now constrained to be >= 0 via softplus reparameterization.
+    In v3.2c, ε went strongly negative on Solar (−0.407) and ETTm1 (−0.328),
+    suppressing mixing on Solar which actually benefits from cross-channel
+    mixing (v3.2 showed −4.1% vs GLPatch). The variance signal is ambiguous:
+    high inter-channel variance can mean independent channels (Exchange —
+    correctly suppressed) OR correlated-but-heteroscedastic channels (Solar —
+    incorrectly suppressed).
 
-  - Fixed ε gradient flow (the real Option C fix):
-    In v3.2 and v3.2b, data_net final layer was zero-initialized on BOTH
-    weight and bias:
-        nn.init.zeros_(self.data_net[2].weight)
-        nn.init.zeros_(self.data_net[2].bias)
-    This means data_correction = 0 for ALL inputs at init, so
-    ε * data_correction = 0 regardless of ε's value → ε receives exactly
-    zero gradient throughout training. The hybrid gate has never actually
-    been hybrid across any experiment.
+    Fix: replace learnable scalar ε with softplus-reparameterized version:
+        ε_raw:  unconstrained learnable scalar, init=0
+        ε_eff:  softplus(ε_raw) — always >= 0
+        gate logit = channel_logits + ε_eff * data_correction
 
-    Fix: keep weight zero-init (preserves the "pure channel at start"
-    guarantee) but use DEFAULT initialization for the bias, so data_net
-    produces non-zero outputs from epoch 1 and ε has actual gradient signal
-    to learn from. ε is still initialized at 0, so early behavior remains
-    pure channel gate — but now it can grow if variance is informative.
+    This means variance can only OPEN the gate further, never suppress it.
+    Suppression of low-C datasets is already handled by channel_net's
+    logC-based signal (init_bias=-5.0 keeps gate near-closed for small C).
 
-    Specifically, the bias of a Linear(d_model//4, d_model) layer defaults
-    to Kaiming uniform ~ U(-1/sqrt(d_model//4), 1/sqrt(d_model//4)).
-    For d_model=512, rank=32, that's ~ U(-0.177, 0.177) — small but nonzero,
-    enough to give ε a gradient from the first batch.
+    softplus(0) ≈ 0.693, so ε_eff starts slightly above zero — still small
+    relative to the −5.0 channel_net bias, so early behaviour is still
+    dominated by the channel gate.
+
+  - get_gate_stats and get_gate_info now report ε_eff = softplus(ε_raw)
+    for interpretability, alongside ε_raw in get_gate_info.
 
 Gate types:
   'hybrid':   log(C) primary + ε·variance correction (RECOMMENDED)
@@ -62,15 +61,14 @@ class AdaptiveGate(nn.Module):
     """
     Hybrid gate: channel-primary with learned data bonus.
 
-    gate = sigmoid( f(logC) + ε · g(variance) )
+    gate = sigmoid( f(logC) + ε_eff · g(variance) )
+
+    where ε_eff = softplus(ε_raw) >= 0 always.
 
     f(logC):      MLP that maps normalized log(C) → per-feature logits
     g(variance):  MLP that maps channel variance → per-feature correction
-    ε:            Learnable scalar, init=0 (pure channel at start)
-
-    Key fix in v3.2c:
-    data_net final bias uses DEFAULT init (not zero) so data_correction != 0
-    from epoch 1, giving ε real gradient signal to learn from.
+    ε_raw:        Unconstrained learnable scalar, init=0
+    ε_eff:        softplus(ε_raw) — non-negative effective epsilon
     """
     def __init__(self, d_model, n_channels=1, gate_type='hybrid', init_bias=-5.0, gate_temp=1.0):
         super().__init__()
@@ -105,20 +103,20 @@ class AdaptiveGate(nn.Module):
             nn.init.constant_(self.channel_net[2].bias, init_bias)
 
             # Data bonus: g(variance) → per-feature correction.
-            # Weight zero-init: preserves "pure channel at start" guarantee.
-            # Bias DEFAULT init: data_net produces nonzero outputs from epoch 1
-            # so ε receives actual gradient signal and can learn.
+            # Weight zero-init preserves "pure channel at start" guarantee.
+            # Bias default init gives ε_eff real gradient signal from epoch 1.
             self.data_net = nn.Sequential(
                 nn.Linear(d_model, d_model // 4),
                 nn.GELU(),
                 nn.Linear(d_model // 4, d_model),
             )
             nn.init.zeros_(self.data_net[2].weight)
-            # data_net[2].bias intentionally left at default Kaiming uniform init
+            # data_net[2].bias left at default Kaiming uniform init
 
-            # ε: learnable scalar, init=0 → pure channel at start.
-            # Now actually receives gradients since data_correction != 0.
-            self.epsilon = nn.Parameter(torch.tensor(0.0))
+            # Unconstrained raw parameter; effective epsilon = softplus(ε_raw) >= 0.
+            # Variance can only open the gate further, never suppress it.
+            # Suppression of low-C is handled by channel_net's logC signal.
+            self._epsilon_raw = nn.Parameter(torch.tensor(0.0))
 
         elif gate_type == 'adaptive':
             gate_input_dim = 2 * d_model + 1
@@ -132,6 +130,10 @@ class AdaptiveGate(nn.Module):
             nn.init.constant_(self.gate_net[2].bias, init_bias)
         else:
             raise ValueError(f"Unknown gate_type: {gate_type}")
+
+    def _epsilon_eff(self):
+        """Effective epsilon: softplus(ε_raw), always >= 0."""
+        return F.softplus(self._epsilon_raw)
 
     def forward(self, x_input, mixed):
         """
@@ -151,12 +153,13 @@ class AdaptiveGate(nn.Module):
 
         elif self.gate_type == 'hybrid':
             log_c_input = self.log_c.view(1, 1)
-            channel_logits = self.channel_net(log_c_input)
+            channel_logits = self.channel_net(log_c_input)     # [1, D]
 
-            chan_var = x_input.var(dim=1)                   # [B, D]
-            data_correction = self.data_net(chan_var)        # [B, D]
+            chan_var = x_input.var(dim=1)                       # [B, D]
+            data_correction = self.data_net(chan_var)           # [B, D]
 
-            logits = channel_logits + self.epsilon * data_correction  # [B, D]
+            # ε_eff >= 0: variance only opens the gate, never closes it
+            logits = channel_logits + self._epsilon_eff() * data_correction
             return torch.sigmoid(self.gate_temp * logits).unsqueeze(1)
 
         elif self.gate_type == 'adaptive':
@@ -182,9 +185,11 @@ class AdaptiveGate(nn.Module):
             elif self.gate_type == 'hybrid':
                 log_c_input = self.log_c.view(1, 1)
                 base = torch.sigmoid(t * self.channel_net(log_c_input))
-                eps = self.epsilon.item()
+                eps_raw = self._epsilon_raw.item()
+                eps_eff = self._epsilon_eff().item()
                 return (f"hybrid (logC={log_c_val:.3f}): "
-                        f"base_gate={base.mean().item():.4f}, ε={eps:.6f}{t_str}")
+                        f"base_gate={base.mean().item():.4f}, "
+                        f"ε_raw={eps_raw:.4f}, ε_eff={eps_eff:.4f}{t_str}")
             else:
                 return f"adaptive (logC={log_c_val:.3f}): input-dependent{t_str}"
 
@@ -273,8 +278,10 @@ class HydraChannelMixer(nn.Module):
         if not hasattr(self, '_last_gate_mean'):
             return "no forward pass yet"
         eps_str = ""
-        if hasattr(self.gate, 'epsilon'):
-            eps_str = f", ε={self.gate.epsilon.item():.6f}"
+        if hasattr(self.gate, '_epsilon_raw'):
+            eps_eff = self.gate._epsilon_eff().item()
+            eps_raw = self.gate._epsilon_raw.item()
+            eps_str = f", ε_raw={eps_raw:.6f}, ε_eff={eps_eff:.6f}"
         return (f"gate=[{self._last_gate_min:.6f}, {self._last_gate_mean:.6f}, {self._last_gate_max:.6f}]"
                 f"{eps_str}"
                 f", |mixed|={self._last_mixed_norm:.4f}"
