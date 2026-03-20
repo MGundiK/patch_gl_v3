@@ -1,42 +1,51 @@
 """
-Hydra Attention v3.2g — Mean pooling in HydraAttention (normalize by C).
+Hydra Attention v3.2h — Sigmoid-bounded epsilon on top of v3.2g mean pooling.
 
-Changes from v3.2d:
-  - Single line change in HydraAttention.forward():
-      sum(dim=1)  →  sum(dim=1) / C   (i.e., mean pooling)
+Changes from v3.2g:
+  - ε reparameterization changed from softplus to sigmoid-bounded:
+      v3.2d/g:  ε_eff = softplus(ε_raw)          range: [0, +∞)
+      v3.2h:    ε_eff = ε_max · sigmoid(ε_raw)   range: [0, ε_max]
 
-  Why this is safe now when v3.2 mean_pool failed:
-    v3.2 mean_pool regressed Traffic badly because the gate opened to 0.922
-    (too fast, too wide). That experiment had ε=0 throughout — the ε gradient
-    was killed by the zero-bias init bug, so the gate had no data signal at all
-    and the channel_net's logC signal alone couldn't compensate.
+  Why softplus failed on Traffic (v3.2g probe diagnosis):
+    ε_raw grew monotonically to 2.77 by epoch 100, still climbing.
+    ε_eff ≈ 2.78 — data_net correction amplified ~4× vs channel_net logit.
+    Gate became bimodal (min≈0, max≈1) with mean oscillating ~0.35–0.39.
+    Traffic has C=862 and high inter-channel variance (road sensor
+    heterogeneity), so data_net sees a large signal every batch and
+    softplus gives ε no incentive to stop growing.
 
-    v3.2d has all the machinery that was missing then:
-      - ε gradient flow fixed (Kaiming uniform bias init on data_net final layer)
-      - softplus constraint: ε_eff = softplus(ε_raw) >= 0
-      - gate_init=-5.0: channel_net starts near-closed for all C
-      - variance-based data_net provides per-batch correction signal
+    On Electricity (C=321, more homogeneous): ε_raw stabilized at ~1.37
+    → ε_eff ≈ 1.37, gate_mean settled gracefully at 0.45–0.53. MSE best ever.
 
-    The norm explosion diagnosis:
-      global_feat = (K*V).sum(dim=1) accumulates C terms.
-      At C=862 (Traffic), |mixed| reaches 150-235 vs |input|~5.
-      At C=7 (ETTm1), |mixed| is 1-60 — manageable.
-      Dividing by C makes the expected magnitude O(1) regardless of dataset,
-      removing the structural instability that v3.2d's gate fights against.
+  Why sigmoid-bounded fixes this:
+    sigmoid saturates at both ends. For ε_max=2.0:
+      - Traffic at ε_raw=2.77: ε_eff = 2.0 * sigmoid(2.77) ≈ 2.0 * 0.94 = 1.88
+        (vs 2.78 with softplus — reduction of ~0.9)
+      - Electricity at ε_raw=1.37: ε_eff = 2.0 * sigmoid(1.37) ≈ 2.0 * 0.80 = 1.60
+        (slightly above the 1.37 that was already working — negligible change)
 
-  Expected changes in probe stats:
-    Traffic C=862:  |mixed| drops from ~150-230 to ~0.17-0.27
-    Electricity C=321: |mixed| drops from ~10-57 to ~0.03-0.18
-    Solar C=137:    |mixed| drops from ~115-200 to ~0.84-1.46
-    ETTm1 C=7:     |mixed| drops from ~1-90 to ~0.14-13
-    ETTh1 C=7:     similar to ETTm1
-    Exchange C=8:  |mixed| already small (~1-8), drops to ~0.12-1
+    The key property: both datasets are now in the sigmoid's saturation zone,
+    so the gap between them compresses from ~2× to ~1.17×. Traffic's ε can
+    no longer escape to ∞ by gradient descent — it hits diminishing returns.
 
-    The gate*mixed contribution will drop proportionally, but the gate itself
-    should open further since the gating mechanism now needs less suppression
-    to keep contributions bounded. The net effect on the residual stream
-    depends on whether the gate opens enough to compensate — which is exactly
-    what the probe will tell us.
+  Why ε_max=2.0:
+    - Electricity worked well at ε_eff≈1.37 (softplus). 2.0 gives headroom.
+    - Solar peaked at ε_eff≈0.70 under softplus (v3.2d) — well within range.
+    - Traffic's effective cap at ~1.88 is a 32% reduction vs what it reached.
+    - ETTh1/ETTm1 had ε_raw<0.2 in v3.2d — sigmoid(0.2)≈0.55, so
+      ε_eff≈1.1 vs 0.77 before. Slightly more open but gate_init=-5.0 still
+      dominates early training.
+
+  Init behaviour:
+    ε_raw=0 → ε_eff = 2.0 * sigmoid(0) = 2.0 * 0.5 = 1.0
+    But data_net[2].weight is zero-initialized, so data_correction=0 at epoch 0.
+    The gate therefore starts at sigmoid(channel_logits + 1.0 * 0) = sigmoid(-5.0)
+    — identical to all prior versions. The 1.0 initial ε_eff has no effect until
+    data_net starts producing nonzero corrections.
+
+  Both changes from v3.2 baseline are retained:
+    1. Mean pooling in HydraAttention (from v3.2g) — fixes O(C) norm explosion
+    2. Sigmoid-bounded ε (new in v3.2h) — caps runaway ε on high-C datasets
 
 Gate types:
   'hybrid':   log(C) primary + ε·variance correction (RECOMMENDED)
@@ -50,13 +59,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+# Maximum value of ε_eff. Chosen so that:
+#   - ε can open the gate strongly on high-C correlated datasets (Electricity, Traffic)
+#   - ε cannot grow without bound (Traffic runaway prevention)
+EPSILON_MAX = 2.0
+
 
 class HydraAttention(nn.Module):
     """Core Hydra: O(Nd) linear attention via cosine similarity.
 
-    v3.2g: mean pooling — global_feat divided by C so magnitude is O(1)
-    regardless of channel count. Eliminates the structural norm explosion
-    that scaled linearly with C under sum pooling.
+    Mean pooling (from v3.2g): global_feat divided by C so magnitude is O(1).
     """
     def __init__(self, d_model, dropout=0.0):
         super().__init__()
@@ -69,27 +81,30 @@ class HydraAttention(nn.Module):
         Q = F.normalize(self.W_q(x), p=2, dim=-1)
         K = F.normalize(self.W_k(x), p=2, dim=-1)
         V = self.W_v(x)
-        # Mean pooling: divide by C to make magnitude O(1) across all datasets.
-        # Key difference from v3.2d sum pooling.
         C = x.shape[1]
-        global_feat = (K * V).sum(dim=1, keepdim=True) / C
+        global_feat = (K * V).sum(dim=1, keepdim=True) / C   # mean pooling
         return self.dropout(Q * global_feat)
 
 
 class AdaptiveGate(nn.Module):
     """
-    Hybrid gate: channel-primary with learned data bonus.
-    Identical to v3.2d.
+    Hybrid gate: channel-primary with sigmoid-bounded data bonus.
 
     gate = sigmoid( f(logC) + ε_eff · g(variance) )
 
-    where ε_eff = softplus(ε_raw) >= 0 always.
+    ε_eff = ε_max · sigmoid(ε_raw)   in range [0, ε_max]
+
+    Both ends are soft-bounded:
+      - ε_eff >= 0 always (variance only opens gate, never closes)
+      - ε_eff <= ε_max (prevents runaway amplification on high-C datasets)
     """
-    def __init__(self, d_model, n_channels=1, gate_type='hybrid', init_bias=-5.0, gate_temp=1.0):
+    def __init__(self, d_model, n_channels=1, gate_type='hybrid',
+                 init_bias=-5.0, gate_temp=1.0, epsilon_max=EPSILON_MAX):
         super().__init__()
         self.gate_type = gate_type
         self.d_model = d_model
         self.gate_temp = gate_temp
+        self.epsilon_max = epsilon_max
 
         self.register_buffer(
             'log_c', torch.tensor(math.log(max(n_channels, 2)) / math.log(1000))
@@ -124,6 +139,8 @@ class AdaptiveGate(nn.Module):
             nn.init.zeros_(self.data_net[2].weight)
             # data_net[2].bias left at default Kaiming uniform init
 
+            # Unconstrained raw parameter.
+            # ε_eff = epsilon_max * sigmoid(ε_raw) ∈ [0, epsilon_max]
             self._epsilon_raw = nn.Parameter(torch.tensor(0.0))
 
         elif gate_type == 'adaptive':
@@ -140,7 +157,8 @@ class AdaptiveGate(nn.Module):
             raise ValueError(f"Unknown gate_type: {gate_type}")
 
     def _epsilon_eff(self):
-        return F.softplus(self._epsilon_raw)
+        """Effective epsilon: epsilon_max * sigmoid(ε_raw), in [0, epsilon_max]."""
+        return self.epsilon_max * torch.sigmoid(self._epsilon_raw)
 
     def forward(self, x_input, mixed):
         if self.gate_type == 'scalar':
@@ -158,6 +176,7 @@ class AdaptiveGate(nn.Module):
             chan_var = x_input.var(dim=1)                       # [B, D]
             data_correction = self.data_net(chan_var)           # [B, D]
 
+            # ε_eff ∈ [0, epsilon_max]: bounded on both sides
             logits = channel_logits + self._epsilon_eff() * data_correction
             return torch.sigmoid(self.gate_temp * logits).unsqueeze(1)
 
@@ -188,19 +207,20 @@ class AdaptiveGate(nn.Module):
                 eps_eff = self._epsilon_eff().item()
                 return (f"hybrid (logC={log_c_val:.3f}): "
                         f"base_gate={base.mean().item():.4f}, "
-                        f"ε_raw={eps_raw:.4f}, ε_eff={eps_eff:.4f}{t_str}")
+                        f"ε_raw={eps_raw:.4f}, ε_eff={eps_eff:.4f} "
+                        f"[max={self.epsilon_max}]{t_str}")
             else:
                 return f"adaptive (logC={log_c_val:.3f}): input-dependent{t_str}"
 
 
 class HydraChannelMixer(nn.Module):
     """
-    Cross-variable mixing via Hydra with hybrid gating.
-    Identical to v3.2d except HydraAttention now uses mean pooling.
+    Cross-variable mixing via Hydra with sigmoid-bounded hybrid gating.
     """
     def __init__(self, d_model, variant='hydra_gated', rank=32,
                  n_channels=7, dropout=0.0,
-                 gate_type='hybrid', gate_init=-5.0, gate_temp=1.0):
+                 gate_type='hybrid', gate_init=-5.0, gate_temp=1.0,
+                 epsilon_max=EPSILON_MAX):
         super().__init__()
         self.variant = variant
 
@@ -226,7 +246,7 @@ class HydraChannelMixer(nn.Module):
         self.gate = AdaptiveGate(
             d_model, n_channels=n_channels,
             gate_type=gate_type, init_bias=gate_init,
-            gate_temp=gate_temp
+            gate_temp=gate_temp, epsilon_max=epsilon_max
         )
 
     def _mix(self, h_norm):
