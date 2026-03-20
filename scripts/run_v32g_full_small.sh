@@ -2,6 +2,10 @@
 
 # GLPatch_Hydra v3.2g — Small datasets
 # ETTh1, ETTh2, ETTm1, ETTm2, Weather, Exchange, ILI
+#
+# NOTE: --placement post_fusion is omitted — verify your run.py args with:
+#   python run.py --help | grep -E "placement|gate|cv_rank|hydra"
+# and add back if supported under a different name.
 
 ma_type=ema
 alpha=0.3
@@ -10,9 +14,8 @@ model_name=GLPatch_Hydra
 gate_type=hybrid
 gate_init=-5.0
 cv_rank=32
-placement=post_fusion
 
-mkdir -p ./logs/glpatch_hydra_v32g
+mkdir -p ./logs/glpatch_hydra_v32g/{ETTh1,ETTh2,ETTm1,ETTm2,Weather,Exchange,ILI}
 
 seq_len=96
 
@@ -26,8 +29,7 @@ do
     --des 'Exp' --itr 1 --batch_size 2048 --learning_rate 0.0005 \
     --lradj 'sigmoid' --ma_type $ma_type --alpha $alpha --beta $beta \
     --gate_type $gate_type --gate_init $gate_init --cv_rank $cv_rank \
-    --placement $placement \
-    > logs/glpatch_hydra_v32g/${model_name}_ETTh1_${seq_len}_${pred_len}.log
+    > logs/glpatch_hydra_v32g/ETTh1/${model_name}_${seq_len}_${pred_len}.log
 
   echo "========== ETTh2 pred_len=${pred_len} =========="
   python -u run.py \
@@ -37,8 +39,7 @@ do
     --des 'Exp' --itr 1 --batch_size 2048 --learning_rate 0.0005 \
     --lradj 'sigmoid' --ma_type $ma_type --alpha $alpha --beta $beta \
     --gate_type $gate_type --gate_init $gate_init --cv_rank $cv_rank \
-    --placement $placement \
-    > logs/glpatch_hydra_v32g/${model_name}_ETTh2_${seq_len}_${pred_len}.log
+    > logs/glpatch_hydra_v32g/ETTh2/${model_name}_${seq_len}_${pred_len}.log
 
   echo "========== ETTm1 pred_len=${pred_len} =========="
   python -u run.py \
@@ -48,8 +49,7 @@ do
     --des 'Exp' --itr 1 --batch_size 2048 --learning_rate 0.0005 \
     --lradj 'sigmoid' --ma_type $ma_type --alpha $alpha --beta $beta \
     --gate_type $gate_type --gate_init $gate_init --cv_rank $cv_rank \
-    --placement $placement \
-    > logs/glpatch_hydra_v32g/${model_name}_ETTm1_${seq_len}_${pred_len}.log
+    > logs/glpatch_hydra_v32g/ETTm1/${model_name}_${seq_len}_${pred_len}.log
 
   echo "========== ETTm2 pred_len=${pred_len} =========="
   python -u run.py \
@@ -59,8 +59,7 @@ do
     --des 'Exp' --itr 1 --batch_size 2048 --learning_rate 0.0001 \
     --lradj 'sigmoid' --ma_type $ma_type --alpha $alpha --beta $beta \
     --gate_type $gate_type --gate_init $gate_init --cv_rank $cv_rank \
-    --placement $placement \
-    > logs/glpatch_hydra_v32g/${model_name}_ETTm2_${seq_len}_${pred_len}.log
+    > logs/glpatch_hydra_v32g/ETTm2/${model_name}_${seq_len}_${pred_len}.log
 
   echo "========== Weather pred_len=${pred_len} =========="
   python -u run.py \
@@ -70,8 +69,7 @@ do
     --des 'Exp' --itr 1 --batch_size 2048 --learning_rate 0.0005 \
     --lradj 'sigmoid' --ma_type $ma_type --alpha $alpha --beta $beta \
     --gate_type $gate_type --gate_init $gate_init --cv_rank $cv_rank \
-    --placement $placement \
-    > logs/glpatch_hydra_v32g/${model_name}_weather_${seq_len}_${pred_len}.log
+    > logs/glpatch_hydra_v32g/Weather/${model_name}_${seq_len}_${pred_len}.log
 
   echo "========== Exchange pred_len=${pred_len} =========="
   python -u run.py \
@@ -81,8 +79,7 @@ do
     --des 'Exp' --itr 1 --batch_size 32 --learning_rate 0.00001 \
     --lradj 'sigmoid' --ma_type $ma_type --alpha $alpha --beta $beta \
     --gate_type $gate_type --gate_init $gate_init --cv_rank $cv_rank \
-    --placement $placement \
-    > logs/glpatch_hydra_v32g/${model_name}_exchange_${seq_len}_${pred_len}.log
+    > logs/glpatch_hydra_v32g/Exchange/${model_name}_${seq_len}_${pred_len}.log
 done
 
 # ILI
@@ -98,8 +95,7 @@ do
     --lradj 'type3' --patch_len 6 --stride 3 \
     --ma_type $ma_type --alpha $alpha --beta $beta \
     --gate_type $gate_type --gate_init $gate_init --cv_rank $cv_rank \
-    --placement $placement \
-    > logs/glpatch_hydra_v32g/${model_name}_ili_${seq_len}_${pred_len}.log
+    > logs/glpatch_hydra_v32g/ILI/${model_name}_${seq_len}_${pred_len}.log
 done
 
 echo "========== v3.2g small datasets complete =========="
