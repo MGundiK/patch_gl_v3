@@ -58,7 +58,7 @@ do
     --des 'Exp' \
     --itr 1 \
     --batch_size 2048 \
-    --learning_rate 0.0005 \
+    --learning_rate 0.0007 \
     --lradj 'sigmoid'\
     --ma_type $ma_type \
     --alpha $alpha \
@@ -79,7 +79,7 @@ do
     --des 'Exp' \
     --itr 1 \
     --batch_size 2048 \
-    --learning_rate 0.0005 \
+    --learning_rate 0.0007 \
     --lradj 'sigmoid'\
     --ma_type $ma_type \
     --alpha $alpha \
@@ -100,7 +100,7 @@ do
     --des 'Exp' \
     --itr 1 \
     --batch_size 2048 \
-    --learning_rate 0.0001 \
+    --learning_rate 0.00005 \
     --lradj 'sigmoid'\
     --ma_type $ma_type \
     --alpha $alpha \
@@ -142,7 +142,7 @@ do
     --des 'Exp' \
     --itr 1 \
     --batch_size 32 \
-    --learning_rate 0.00001 \
+    --learning_rate 0.000005 \
     --lradj 'sigmoid'\
     --ma_type $ma_type \
     --alpha $alpha \
@@ -163,7 +163,7 @@ do
     --des 'Exp' \
     --itr 1 \
     --batch_size 96 \
-    --learning_rate 0.005 \
+    --learning_rate 0.002 \
     --lradj 'sigmoid'\
     --ma_type $ma_type \
     --alpha $alpha \
@@ -205,7 +205,7 @@ do
     --des 'Exp' \
     --itr 1 \
     --batch_size 512 \
-    --learning_rate 0.005 \
+    --learning_rate 0.01 \
     --lradj 'sigmoid'\
     --ma_type $ma_type \
     --alpha $alpha \
