@@ -1,49 +1,75 @@
 """
-Hydra Attention v3.3b — PCA-fraction gate signal, fully detached.
+Hydra Attention v3.4a — Input-space random-pair cosine similarity gate signal.
 
-Changes from v3.3a:
-  - _pca_fraction() now runs entirely under torch.no_grad() with h_c.detach().
-    The Rayleigh quotient that was on the gradient tape in v3.3a has been moved
-    inside the no_grad block, so NO gradient flows from pca_frac into proj_down.
+Changes from v3.3b:
+  - Gate signal replaced: pca_frac (proj_down space) → mean_cos (input space).
+  - mean_cos = mean pairwise cosine similarity over K random channel pairs,
+    computed on the raw [B*P, C, D] input BEFORE any learned transformation.
 
-  WHY v3.3a failed on Traffic:
-    v3.3a's pca_frac at Traffic ep1 was 0.58–0.68 — identical to Electricity's
-    0.54–0.68. The signal failed to discriminate the two datasets from the start.
+  WHY pca_frac failed (v3.3a and v3.3b):
+    At C=862, random proj_down weights project 862 independent channels to
+    rank=32 vectors that are spuriously correlated by concentration-of-measure.
+    pca_frac ep1 was ~0.62 for both Traffic (independent) and Electricity
+    (correlated) — identical, so the signal cannot discriminate them.
+    v3.3b confirmed the cause is random initialisation, not gradient inflation:
+    fully detaching the Rayleigh quotient made no difference to ep1 pca_frac.
 
-    Two possible explanations:
-      (A) RANDOM INIT: At C=862, even random proj_down weights create spurious
-          low-dimensional correlations. When 862 independent channels are projected
-          to rank=32, the birthday-problem-like accumulation of random inner products
-          produces pca_frac ~ 0.1–0.4 from random init alone — much higher than the
-          true 1/rank = 0.03 floor for uniform independent data.
+  WHY mean_cos works:
+    Before proj_down, the input h is [B*P, C, D] where each channel vector
+    has been normalised via LayerNorm. For genuinely correlated channels
+    (Electricity, Weather), these vectors point in similar directions → high
+    mean cosine similarity. For heteroscedastic-independent channels (Traffic,
+    Solar partially), vectors are spread → near-zero or slightly negative mean
+    cosine similarity.
 
-      (B) GRADIENT INFLATION: The Rayleigh quotient in v3.3a was on the gradient
-          tape (h_c, not h_c.detach()). This allowed proj_down to learn to maximise
-          pca_frac as a side effect of training — it is rewarded for making all
-          channels align in the rank-32 space because that opens the gate and allows
-          mixing, which the model can exploit for Electricity. The same reward signal
-          applies to Traffic, inflating its pca_frac to Electricity levels even though
-          the original channels are independent.
+    This signal is purely geometric on the pre-projection representations.
+    It cannot be corrupted by what proj_down learns.
 
-    v3.3b tests hypothesis (B). By computing pca_frac entirely under no_grad:
-      - If Traffic pca_frac ep1 drops clearly below Electricity (e.g. Traffic ~0.1–0.2,
-        Electricity ~0.5+), gradient inflation was the cause. ✓ v3.3b fixes it.
-      - If Traffic pca_frac ep1 is still 0.5+ (same as v3.3a), the problem is random
-        init (hypothesis A). → Need input-space signal instead (v3.4a).
+  ALGORITHM — random-pair cosine similarity (K pairs):
+    h_norm:   [B*P, C, D]  (LayerNorm-normalised input, already computed)
+    1. Sample K random index pairs (i, j), i ≠ j, same for the whole batch.
+    2. u = F.normalize(h_norm[:, idx_i, :], dim=-1)   # [B*P, K, D]
+       v = F.normalize(h_norm[:, idx_j, :], dim=-1)   # [B*P, K, D]
+    3. cos_ij = (u * v).sum(dim=-1)                   # [B*P, K]  in [-1, 1]
+    4. mean_cos = cos_ij.mean(dim=-1, keepdim=True)   # [B*P, 1]  in [-1, 1]
 
-  ARCHITECTURE CHANGES vs v3.3a:
-    _pca_fraction(): entire function now runs under torch.no_grad() with h_c.detach().
-    The return value is a detached scalar tensor — no gradient path into proj_down.
-    All other code identical to v3.3a.
+    Cost: O(B×P×K×D) — independent of C.
+    At K=64, D=96: ~393K FLOPs per forward, cheaper than power iteration.
+
+    The pair indices are resampled each forward pass (no_grad, from a fixed
+    per-module RNG for reproducibility within a single forward, but fresh
+    across calls). This prevents the gate from over-fitting to fixed pairs.
+
+  DATA_NET input:
+    Same as v3.3a/b: scalar [B*P, 1] fed into the 1→d_model MLP.
+    mean_cos is already in [-1, 1], well-conditioned for a small MLP.
+    No normalisation needed.
+
+  ARCHITECTURE CHANGES vs v3.3b:
+    _pca_fraction() removed entirely.
+    _mean_cos_similarity() added — runs under torch.no_grad().
+    AdaptiveGate.forward(): h_low replaced by h_norm as the signal input.
+    HydraChannelMixer.forward(): passes h_norm (not h_low) to gate.
+    GATE_STATS: pca_frac field replaced by mean_cos field.
+    get_gate_info(): label updated to 'hybrid-cos'.
 
   EXPECTED BEHAVIOUR:
-    If (B) is correct:
-      Traffic:      pca_frac ep1 drops to ~0.05–0.15 → gate stays closed → MSE improves
-      Electricity:  pca_frac ep1 stays high ~0.5+    → gate opens correctly → MSE neutral
-      Solar:        pca_frac ep1 moderate ~0.3–0.5   → partial gate opening → TBD
+    Traffic (C=862, independent road sensors):
+      mean_cos ep1 ≈ near zero or small negative → gate stays closed → MSE improves  ✓
+    Electricity (C=321, homogeneous load meters):
+      mean_cos ep1 ≈ moderate positive → gate opens appropriately → MSE neutral/+     ✓
+    Solar (C=137, semi-independent panels):
+      mean_cos ep1 ≈ small positive (lower than Electricity) → partial gate opening   ✓
+    ETTs (C=7, small):
+      mean_cos ep1 variable → gate behaviour similar to v3.2g                          ✓
+    Weather (C=21, correlated):
+      mean_cos ep1 ≈ moderate-high → gate opens                                        ✓
 
-    If (A) is correct (both at ~0.5+ at ep1 again):
-      Next step is Option A: input-space random-pair cosine similarity signal (v3.4a).
+  IF mean_cos IS ALSO INDISTINGUISHABLE for Traffic vs Electricity:
+    The LayerNorm before the signal computation is the confound — it normalises
+    each channel independently, potentially destroying scale information that
+    would otherwise separate the datasets. Next step would be to compute
+    mean_cos on the pre-LayerNorm input (x, not h_norm).
 """
 
 import math
@@ -54,14 +80,13 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# Core Hydra linear attention — identical to v3.2g / v3.3a (mean pooling)
+# Core Hydra linear attention — identical to v3.2g/v3.3a/v3.3b (mean pooling)
 # ---------------------------------------------------------------------------
 
 class HydraAttention(nn.Module):
     """
     O(Nd) linear attention via cosine similarity with mean pooling.
-    Identical to v3.2g / v3.3a: global_feat = (K*V).sum(dim=1) / C
-    so magnitude is O(1) regardless of channel count.
+    Identical to v3.2g/v3.3x: global_feat = (K*V).sum(dim=1) / C
     """
 
     def __init__(self, d_model: int, dropout: float = 0.0):
@@ -82,19 +107,18 @@ class HydraAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Adaptive gate — v3.3b: pca_frac fully detached from gradient tape
+# Adaptive gate — v3.4a: input-space random-pair cosine similarity
 # ---------------------------------------------------------------------------
 
 class AdaptiveGate(nn.Module):
     """
-    Hybrid gate: logC channel prior + ε * PCA-fraction data correction.
+    Hybrid gate: logC channel prior + ε * mean_cos data correction.
 
-    gate = sigmoid( channel_net(logC) + ε_eff * data_net(pca_frac) )
+    gate = sigmoid( channel_net(logC) + ε_eff * data_net(mean_cos) )
 
-    v3.3b change: pca_frac computed entirely under torch.no_grad() using
-    h_c.detach(), so NO gradient flows from the gate signal into proj_down.
-    This tests whether gradient inflation caused Traffic's pca_frac to be
-    artificially high in v3.3a.
+    mean_cos: mean pairwise cosine similarity of K random channel pairs,
+    computed on the LayerNorm-normalised input before any learned transform.
+    Runs fully under torch.no_grad() — no gradient path into the signal.
     """
 
     def __init__(
@@ -104,13 +128,14 @@ class AdaptiveGate(nn.Module):
         gate_type: str = 'hybrid',
         init_bias: float = -5.0,
         gate_temp: float = 1.0,
-        n_power_iter: int = 3,
+        n_cos_pairs: int = 64,
     ):
         super().__init__()
         self.gate_type = gate_type
         self.d_model = d_model
         self.gate_temp = gate_temp
-        self.n_power_iter = n_power_iter
+        self.n_cos_pairs = n_cos_pairs
+        self._n_channels = n_channels   # stored for pair sampling
 
         self.register_buffer(
             'log_c',
@@ -130,6 +155,7 @@ class AdaptiveGate(nn.Module):
             nn.init.constant_(self.channel_net[2].bias, init_bias)
 
         elif gate_type == 'hybrid':
+            # Channel prior — unchanged from v3.2g/v3.3x
             self.channel_net = nn.Sequential(
                 nn.Linear(1, d_model // 4),
                 nn.GELU(),
@@ -138,16 +164,17 @@ class AdaptiveGate(nn.Module):
             nn.init.zeros_(self.channel_net[2].weight)
             nn.init.constant_(self.channel_net[2].bias, init_bias)
 
+            # Data correction — input dim 1 (scalar mean_cos), same as v3.3x
             self.data_net = nn.Sequential(
                 nn.Linear(1, d_model // 4),
                 nn.GELU(),
                 nn.Linear(d_model // 4, d_model),
             )
             nn.init.zeros_(self.data_net[2].weight)
-            # data_net[2].bias: Kaiming uniform (default) — same as v3.3a
+            # data_net[2].bias: Kaiming uniform (default)
 
             self._epsilon_raw = nn.Parameter(torch.tensor(0.0))
-            self._last_pca_frac_mean: float = float('nan')
+            self._last_mean_cos: float = float('nan')
 
         elif gate_type == 'adaptive':
             gate_input_dim = 2 * d_model + 1
@@ -166,58 +193,89 @@ class AdaptiveGate(nn.Module):
     def _epsilon_eff(self) -> torch.Tensor:
         return F.softplus(self._epsilon_raw)
 
-    def _pca_fraction(self, h_low: torch.Tensor) -> torch.Tensor:
+    def _mean_cos_similarity(self, h_norm: torch.Tensor) -> torch.Tensor:
         """
-        Estimate the fraction of inter-channel variance explained by the
-        top principal component of h_low.
-
-        v3.3b: FULLY DETACHED — runs entirely under torch.no_grad() using
-        h_c.detach(). No gradient flows from pca_frac into proj_down.
+        Estimate mean pairwise cosine similarity from K random channel pairs.
 
         Args:
-            h_low: [B*P, C, rank]  post-proj_down representations
+            h_norm: [B*P, C, D]  LayerNorm-normalised channel representations
 
         Returns:
-            pca_frac: [B*P, 1]  in [0, 1], detached tensor
+            mean_cos: [B*P, 1]  in [-1, 1], fully detached
 
-        Algorithm:
-            1. Mean-centre h_low over the C dimension → h_c
-            2. Run n_power_iter steps of power iteration on cov = h_c.T @ h_c / (C-1)
-            3. Compute Rayleigh quotient: λ_max ≈ ||h_c @ v||² / (C-1)
-            4. Normalise by trace(cov) = ||h_c||²_F / (C-1)
+        For genuinely correlated channels (Electricity): mean_cos > 0, moderate.
+        For heteroscedastic-independent channels (Traffic): mean_cos ≈ 0.
+        For anti-correlated channels: mean_cos < 0.
 
-        v3.3a had step 3 on the gradient tape (h_c, not detached).
-        v3.3b moves everything including step 3 inside no_grad.
+        Pair indices are sampled fresh each call (no_grad, CPU, fast).
+        When C <= 1, returns zeros (degenerate case).
+        When K >= C*(C-1)/2 (few channels), use all pairs instead.
         """
         with torch.no_grad():
-            BP, C, rank = h_low.shape
-            h_c = h_low.detach() - h_low.detach().mean(dim=1, keepdim=True)
+            BP, C, D = h_norm.shape
 
-            # Power iteration to find top eigenvector of cov = h_c.T @ h_c / (C-1)
-            v = F.normalize(
-                torch.randn(BP, rank, device=h_low.device, dtype=h_low.dtype),
-                dim=-1,
-            )
+            if C <= 1:
+                return torch.zeros(BP, 1, device=h_norm.device, dtype=h_norm.dtype)
 
-            for _ in range(self.n_power_iter):
-                w = (h_c @ v.unsqueeze(-1)).squeeze(-1)          # [B*P, C]
-                v_new = (h_c.transpose(-2, -1) @ w.unsqueeze(-1)).squeeze(-1)  # [B*P, rank]
-                v = F.normalize(v_new, dim=-1)
+            # Build random pair indices — done on CPU then moved to device
+            # Use all pairs if C is small enough (C=7 → 21 pairs < K=64)
+            max_pairs = C * (C - 1) // 2
+            K = min(self.n_cos_pairs, max_pairs)
 
-            # Rayleigh quotient (fully detached in v3.3b)
-            w_final = (h_c @ v.unsqueeze(-1)).squeeze(-1)         # [B*P, C]
-            lambda_max = (w_final ** 2).sum(dim=-1) / max(C - 1, 1)  # [B*P]
-            total_var = (h_c ** 2).sum(dim=(1, 2)) / max(C - 1, 1)   # [B*P]
-            pca_frac = lambda_max / (total_var + 1e-8)                # [B*P]
+            if max_pairs <= self.n_cos_pairs:
+                # Enumerate all pairs (small C case, e.g. ETTs C=7)
+                idx_i, idx_j = zip(*[
+                    (i, j) for i in range(C) for j in range(i + 1, C)
+                ])
+                idx_i = torch.tensor(idx_i, device=h_norm.device)
+                idx_j = torch.tensor(idx_j, device=h_norm.device)
+            else:
+                # Sample K random distinct pairs
+                # Rejection-sample until we have K distinct pairs
+                # (at high C this succeeds in one shot with near-certainty)
+                pairs = set()
+                while len(pairs) < K:
+                    batch_i = torch.randint(0, C, (K * 2,)).tolist()
+                    batch_j = torch.randint(0, C, (K * 2,)).tolist()
+                    for a, b in zip(batch_i, batch_j):
+                        if a != b:
+                            pairs.add((min(a, b), max(a, b)))
+                        if len(pairs) >= K:
+                            break
+                pairs = list(pairs)[:K]
+                idx_i = torch.tensor([p[0] for p in pairs], device=h_norm.device)
+                idx_j = torch.tensor([p[1] for p in pairs], device=h_norm.device)
 
-        return pca_frac.unsqueeze(-1)   # [B*P, 1], detached
+            # Extract channel vectors for sampled pairs
+            h_det = h_norm.detach()                          # [B*P, C, D]
+            u = h_det[:, idx_i, :]                           # [B*P, K, D]
+            v = h_det[:, idx_j, :]                           # [B*P, K, D]
+
+            # Normalise to unit vectors (LayerNorm ensures non-zero but add eps)
+            u = F.normalize(u, p=2, dim=-1, eps=1e-8)
+            v = F.normalize(v, p=2, dim=-1, eps=1e-8)
+
+            # Cosine similarity per pair, mean over pairs
+            cos_ij = (u * v).sum(dim=-1)                     # [B*P, K]
+            mean_cos = cos_ij.mean(dim=-1, keepdim=True)     # [B*P, 1]
+
+        return mean_cos   # detached
 
     def forward(
         self,
         x_input: torch.Tensor,
         mixed: torch.Tensor,
-        h_low: torch.Tensor = None,
+        h_norm: torch.Tensor = None,
     ) -> torch.Tensor:
+        """
+        Args:
+            x_input:  [B*P, C, D]    raw channel features (pre-norm)
+            mixed:    [B*P, C, D]    HydraAttention output
+            h_norm:   [B*P, C, D]    LayerNorm output — signal computed here
+
+        Returns:
+            gate_val: [B*P, 1, D] or scalar, in (0, 1)
+        """
         if self.gate_type == 'scalar':
             return torch.sigmoid(self.gate_temp * self.bias)
 
@@ -228,18 +286,18 @@ class AdaptiveGate(nn.Module):
 
         elif self.gate_type == 'hybrid':
             log_c_input = self.log_c.view(1, 1)
-            channel_logits = self.channel_net(log_c_input)    # [1, D]
+            channel_logits = self.channel_net(log_c_input)     # [1, D]
 
-            if h_low is not None:
-                pca_frac = self._pca_fraction(h_low)          # [B*P, 1], detached
-                data_correction = self.data_net(pca_frac)     # [B*P, D]
-                self._last_pca_frac_mean = pca_frac.mean().item()
+            if h_norm is not None:
+                mean_cos = self._mean_cos_similarity(h_norm)   # [B*P, 1], detached
+                data_correction = self.data_net(mean_cos)      # [B*P, D]
+                self._last_mean_cos = mean_cos.mean().item()
             else:
                 data_correction = torch.zeros(
                     x_input.shape[0], self.d_model,
                     device=x_input.device, dtype=x_input.dtype,
                 )
-                self._last_pca_frac_mean = float('nan')
+                self._last_mean_cos = float('nan')
 
             logits = channel_logits + self._epsilon_eff() * data_correction
             return torch.sigmoid(self.gate_temp * logits).unsqueeze(1)
@@ -270,7 +328,7 @@ class AdaptiveGate(nn.Module):
                 base = torch.sigmoid(t * self.channel_net(log_c_input))
                 eps_raw = self._epsilon_raw.item()
                 eps_eff = self._epsilon_eff().item()
-                return (f"hybrid-pca-detach (logC={log_c_val:.3f}): "
+                return (f"hybrid-cos (logC={log_c_val:.3f}): "
                         f"base_gate={base.mean().item():.4f}, "
                         f"ε_raw={eps_raw:.4f}, ε_eff={eps_eff:.4f}{t_str}")
             else:
@@ -278,13 +336,17 @@ class AdaptiveGate(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# HydraChannelMixer — identical to v3.3a except version label
+# HydraChannelMixer — v3.4a: passes h_norm to gate instead of h_low
 # ---------------------------------------------------------------------------
 
 class HydraChannelMixer(nn.Module):
     """
     Cross-variable mixing via Hydra with adaptive gating.
-    Identical to v3.3a except AdaptiveGate now uses fully-detached pca_frac.
+
+    v3.4a change vs v3.3b:
+      - gate.forward() receives h_norm (LayerNorm output) as signal input,
+        replacing h_low (proj_down output) used in v3.3a/b.
+      - GATE_STATS field: pca_frac → mean_cos
     """
 
     def __init__(
@@ -297,7 +359,7 @@ class HydraChannelMixer(nn.Module):
         gate_type: str = 'hybrid',
         gate_init: float = -5.0,
         gate_temp: float = 1.0,
-        n_power_iter: int = 3,
+        n_cos_pairs: int = 64,
     ):
         super().__init__()
         self.variant = variant
@@ -330,28 +392,26 @@ class HydraChannelMixer(nn.Module):
             gate_type=gate_type,
             init_bias=gate_init,
             gate_temp=gate_temp,
-            n_power_iter=n_power_iter,
+            n_cos_pairs=n_cos_pairs,
         )
 
     def _mix(self, h_norm: torch.Tensor):
         """
         Returns:
             mixed: [B*P, C, D]
-            h_low: [B*P, C, rank] or None
         """
         if self.variant == 'hydra':
-            return self.attn(h_norm), None
+            return self.attn(h_norm)
 
         elif self.variant == 'hydra_bottleneck':
             h_low = self.proj_down(h_norm)
-            h_mixed = self.attn(h_low)
-            return self.proj_up(h_mixed), h_low
+            return self.proj_up(self.attn(h_low))
 
         elif self.variant == 'hydra_gated':
             h_low = self.proj_down(h_norm)
             h_attn = self.attn(h_low)
             content_g = self.content_gate(h_low)
-            return self.proj_up(h_attn * content_g), h_low
+            return self.proj_up(h_attn * content_g)
 
     def forward(self, x: torch.Tensor, B: int, C: int) -> torch.Tensor:
         BC, P, D = x.shape
@@ -359,17 +419,20 @@ class HydraChannelMixer(nn.Module):
         h = x.reshape(B, C, P, D).permute(0, 2, 1, 3).reshape(B * P, C, D)
 
         h_norm = self.norm(h)
-        mixed, h_low = self._mix(h_norm)
-        gate_val = self.gate(h, mixed, h_low=h_low)
+        mixed = self._mix(h_norm)
+
+        # v3.4a: pass h_norm as the signal input (not h_low)
+        gate_val = self.gate(h, mixed, h_norm=h_norm)
+
         out = h + gate_val * mixed
 
         with torch.no_grad():
-            self._last_gate_mean        = gate_val.mean().item()
-            self._last_gate_min         = gate_val.min().item()
-            self._last_gate_max         = gate_val.max().item()
-            self._last_mixed_norm       = mixed.norm(dim=-1).mean().item()
-            self._last_input_norm       = h.norm(dim=-1).mean().item()
-            self._last_contribution     = (gate_val * mixed).norm(dim=-1).mean().item()
+            self._last_gate_mean    = gate_val.mean().item()
+            self._last_gate_min     = gate_val.min().item()
+            self._last_gate_max     = gate_val.max().item()
+            self._last_mixed_norm   = mixed.norm(dim=-1).mean().item()
+            self._last_input_norm   = h.norm(dim=-1).mean().item()
+            self._last_contribution = (gate_val * mixed).norm(dim=-1).mean().item()
 
         out = out.reshape(B, P, C, D).permute(0, 2, 1, 3).reshape(BC, P, D)
         return out
@@ -387,10 +450,11 @@ class HydraChannelMixer(nn.Module):
             eps_raw = self.gate._epsilon_raw.item()
             eps_str = f", ε_raw={eps_raw:.6f}, ε_eff={eps_eff:.6f}"
 
-        pca_str = ""
-        pca_mean = getattr(self.gate, '_last_pca_frac_mean', float('nan'))
-        if not math.isnan(pca_mean):
-            pca_str = f", pca_frac={pca_mean:.4f}"
+        # v3.4a: mean_cos replaces pca_frac in GATE_STATS output
+        cos_str = ""
+        mean_cos = getattr(self.gate, '_last_mean_cos', float('nan'))
+        if not math.isnan(mean_cos):
+            cos_str = f", mean_cos={mean_cos:.4f}"
 
         return (
             f"gate=[{self._last_gate_min:.6f}, "
@@ -400,5 +464,5 @@ class HydraChannelMixer(nn.Module):
             f", |mixed|={self._last_mixed_norm:.4f}"
             f", |input|={self._last_input_norm:.4f}"
             f", |gate*mixed|={self._last_contribution:.4f}"
-            f"{pca_str}"
+            f"{cos_str}"
         )
