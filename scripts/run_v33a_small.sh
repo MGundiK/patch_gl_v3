@@ -13,7 +13,7 @@ python -u run.py \
   --model_id ETTh1_${pred_len}_v33a \
   --model GLPatch_Hydra \
   --data ETTh1 \
-  --root_path ./dataset/ETT-small/ \
+  --root_path ./dataset/ \
   --data_path ETTh1.csv \
   --features M \
   --seq_len 96 \
@@ -45,7 +45,7 @@ python -u run.py \
   --model_id ETTh2_${pred_len}_v33a \
   --model GLPatch_Hydra \
   --data ETTh2 \
-  --root_path ./dataset/ETT-small/ \
+  --root_path ./dataset/ \
   --data_path ETTh2.csv \
   --features M \
   --seq_len 96 \
@@ -77,7 +77,7 @@ python -u run.py \
   --model_id ETTm1_${pred_len}_v33a \
   --model GLPatch_Hydra \
   --data ETTm1 \
-  --root_path ./dataset/ETT-small/ \
+  --root_path ./dataset/ \
   --data_path ETTm1.csv \
   --features M \
   --seq_len 96 \
@@ -109,7 +109,7 @@ python -u run.py \
   --model_id ETTm2_${pred_len}_v33a \
   --model GLPatch_Hydra \
   --data ETTm2 \
-  --root_path ./dataset/ETT-small/ \
+  --root_path ./dataset/ \
   --data_path ETTm2.csv \
   --features M \
   --seq_len 96 \
@@ -141,7 +141,7 @@ python -u run.py \
   --model_id Weather_${pred_len}_v33a \
   --model GLPatch_Hydra \
   --data custom \
-  --root_path ./dataset/weather/ \
+  --root_path ./dataset/ \
   --data_path weather.csv \
   --features M \
   --seq_len 96 \
@@ -173,7 +173,7 @@ python -u run.py \
   --model_id Exchange_${pred_len}_v33a \
   --model GLPatch_Hydra \
   --data custom \
-  --root_path ./dataset/exchange_rate/ \
+  --root_path ./dataset/ \
   --data_path exchange_rate.csv \
   --features M \
   --seq_len 96 \
@@ -206,7 +206,7 @@ python -u run.py \
   --model_id ILI_${pred_len}_v33a \
   --model GLPatch_Hydra \
   --data custom \
-  --root_path ./dataset/illness/ \
+  --root_path ./dataset/ \
   --data_path national_illness.csv \
   --features M \
   --seq_len 36 \
