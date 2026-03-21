@@ -12,7 +12,7 @@ python -u run.py \
   --model_id electricity_${pred_len}_v33a \
   --model GLPatch_Hydra \
   --data custom \
-  --root_path ./dataset/electricity/ \
+  --root_path ./dataset/ \
   --data_path electricity.csv \
   --features M \
   --seq_len 96 \
