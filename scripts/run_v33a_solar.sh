@@ -12,8 +12,8 @@ python -u run.py \
   --model_id solar_${pred_len}_v33a \
   --model GLPatch_Hydra \
   --data Solar \
-  --root_path ./dataset/Solar/ \
-  --data_path solar_AL.txt \
+  --root_path ./dataset/ \
+  --data_path solar.txt \
   --features M \
   --seq_len 96 \
   --label_len 48 \
