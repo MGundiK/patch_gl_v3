@@ -12,7 +12,7 @@ python -u run.py \
   --model_id traffic_${pred_len}_v33a \
   --model GLPatch_Hydra \
   --data custom \
-  --root_path ./dataset/traffic/ \
+  --root_path ./dataset/ \
   --data_path traffic.csv \
   --features M \
   --seq_len 96 \
